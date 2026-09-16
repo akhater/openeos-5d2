@@ -61,7 +61,6 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -96,8 +95,6 @@ import dev.openeos.control.data.FocusDriveStep
 import dev.openeos.control.data.LiveViewSize
 import dev.openeos.control.data.LiveViewSource
 import java.util.Date
-import kotlinx.coroutines.flow.distinctUntilChanged
-import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -636,22 +633,6 @@ private fun ExposureDial(
                 listState.animateScrollToItem(confirmedIndex)
             }
         }
-    }
-
-    LaunchedEffect(listState, values) {
-        snapshotFlow { listState.isScrollInProgress }
-            .distinctUntilChanged()
-            .filter { scrolling -> !scrolling }
-            .collect {
-                val viewportCenter = (listState.layoutInfo.viewportStartOffset + listState.layoutInfo.viewportEndOffset) / 2
-                val centered = listState.layoutInfo.visibleItemsInfo.minByOrNull { item ->
-                    abs((item.offset + item.size / 2) - viewportCenter)
-                } ?: return@collect
-                if (centered.index != selectedIndex) {
-                    selectedIndex = centered.index
-                    onSelect(values[centered.index])
-                }
-            }
     }
 
     Column(
