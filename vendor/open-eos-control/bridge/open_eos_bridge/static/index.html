@@ -1,0 +1,577 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0d0e">
+  <title>Open EOS Control</title>
+  <link rel="icon" href="/app/app-icon.png">
+  <link rel="stylesheet" href="/app/styles.css">
+</head>
+<body>
+  <div id="app">
+    <section id="connection-view" class="connection-shell">
+      <header class="connection-brand">
+        <img src="/app/app-icon.png" alt="" width="64" height="64">
+        <div>
+          <h1>Open EOS Control</h1>
+          <p data-i18n="desktopControl">Desktop control</p>
+        </div>
+        <label class="compact-field language-field">
+          <span class="sr-only" data-i18n="language">Language</span>
+          <span class="icon" data-icon="languages" aria-hidden="true"></span>
+          <select class="language-select" aria-label="Language">
+            <option value="auto">Auto</option>
+            <option value="en">English</option>
+            <option value="zh-TW">繁體中文</option>
+          </select>
+        </label>
+      </header>
+
+      <main class="connection-main">
+        <div class="connection-tool">
+          <div class="section-heading">
+            <div>
+              <h2 data-i18n="connectCamera">Connect camera</h2>
+              <p id="engine-state" class="supporting" data-i18n="checkingBridge">Checking bridge</p>
+            </div>
+            <span id="health-dot" class="status-dot warning" aria-hidden="true"></span>
+          </div>
+
+          <label class="field">
+            <span data-i18n="bearerToken">Bearer token</span>
+            <input id="token-input" type="password" autocomplete="off" spellcheck="false"
+                   data-i18n-placeholder="tokenOptional" placeholder="Optional on loopback">
+          </label>
+
+          <div id="connection-mode" class="connection-mode" role="group" aria-label="Connection type" data-i18n-aria="connectionType">
+            <button id="usb-mode-button" class="active" type="button" data-connection-mode="usb">
+              <span class="icon" data-icon="usb" aria-hidden="true"></span>
+              <span data-i18n="usbCamera">USB camera</span>
+            </button>
+            <button id="ccapi-mode-button" type="button" data-connection-mode="ccapi">
+              <span class="icon" data-icon="wifi" aria-hidden="true"></span>
+              <span data-i18n="wirelessCcapi">Wireless CCAPI</span>
+            </button>
+          </div>
+
+          <div id="usb-connection-fields">
+            <label class="field">
+              <span data-i18n="camera">Camera</span>
+              <select id="camera-select" disabled>
+                <option value="" data-i18n="scanFirst">Scan for a camera first</option>
+              </select>
+            </label>
+          </div>
+
+          <div id="ccapi-connection-fields" hidden>
+            <label class="field">
+              <span data-i18n="cameraUrl">Camera URL</span>
+              <input id="ccapi-url-input" type="url" inputmode="url" autocomplete="url" spellcheck="false"
+                     data-i18n-placeholder="cameraUrlPlaceholder" placeholder="http://192.168.1.2:8080">
+            </label>
+            <details class="credential-fields">
+              <summary data-i18n="cameraCredentials">Camera credentials</summary>
+              <label class="field">
+                <span data-i18n="username">Username</span>
+                <input id="ccapi-username-input" type="text" autocomplete="username" spellcheck="false">
+              </label>
+              <label class="field">
+                <span data-i18n="password">Password</span>
+                <input id="ccapi-password-input" type="password" autocomplete="current-password" spellcheck="false">
+              </label>
+            </details>
+          </div>
+
+          <div class="connection-actions">
+            <button id="scan-button" class="button secondary" type="button">
+              <span class="icon" data-icon="refresh-cw" aria-hidden="true"></span>
+              <span data-i18n="scan">Scan</span>
+            </button>
+            <button id="connect-button" class="button primary" type="button" disabled>
+              <span class="icon" data-icon="plug" aria-hidden="true"></span>
+              <span data-i18n="connect">Connect</span>
+            </button>
+          </div>
+          <p id="connection-error" class="inline-error" role="alert" hidden></p>
+        </div>
+      </main>
+    </section>
+
+    <section id="control-view" class="control-shell" hidden>
+      <header class="topbar">
+        <div class="camera-identity">
+          <img src="/app/app-icon.png" alt="" width="36" height="36">
+          <div class="identity-copy">
+            <strong id="camera-name">Canon EOS</strong>
+            <span><span class="status-dot success" aria-hidden="true"></span><span data-i18n="connected">Connected</span></span>
+          </div>
+        </div>
+
+        <nav class="view-tabs" aria-label="Views" data-i18n-aria="views">
+          <button class="tab active" type="button" data-view="live" aria-current="page" data-i18n-aria="control">
+            <span class="icon" data-icon="camera" aria-hidden="true"></span><span data-i18n="control">Control</span>
+          </button>
+          <button class="tab" type="button" data-view="media" data-i18n-aria="media">
+            <span class="icon" data-icon="images" aria-hidden="true"></span><span data-i18n="media">Media</span>
+          </button>
+          <button class="tab" type="button" data-view="diagnostics" data-i18n-aria="diagnostics">
+            <span class="icon" data-icon="bug" aria-hidden="true"></span><span data-i18n="diagnostics">Diagnostics</span>
+          </button>
+        </nav>
+
+        <div class="topbar-actions">
+          <div class="camera-metrics" aria-label="Camera status" data-i18n-aria="cameraStatus">
+            <span title="Battery"><span class="icon" data-icon="battery" aria-hidden="true"></span><span id="battery-value">-</span></span>
+            <span title="Storage"><span class="icon" data-icon="hard-drive" aria-hidden="true"></span><span id="storage-value">-</span></span>
+          </div>
+          <label class="compact-field">
+            <span class="sr-only" data-i18n="language">Language</span>
+            <span class="icon" data-icon="languages" aria-hidden="true"></span>
+            <select class="language-select" aria-label="Language">
+              <option value="auto">Auto</option>
+              <option value="en">English</option>
+              <option value="zh-TW">繁體中文</option>
+            </select>
+          </label>
+          <button id="refresh-button" class="icon-button" type="button" data-tooltip="Refresh" data-i18n-aria="refresh">
+            <span class="icon" data-icon="refresh-cw" aria-hidden="true"></span>
+          </button>
+          <button id="disconnect-button" class="icon-button danger" type="button" data-tooltip="Disconnect" data-i18n-aria="disconnect">
+            <span class="icon" data-icon="power" aria-hidden="true"></span>
+          </button>
+        </div>
+      </header>
+
+      <main id="live-panel" class="live-workspace view-panel">
+        <section class="viewfinder-column">
+          <div id="viewfinder" class="viewfinder">
+            <img id="live-image" alt="Camera Live View" hidden>
+            <video id="local-video" aria-label="Local video input" autoplay muted playsinline hidden></video>
+            <canvas id="monitor-lut-preview" class="monitor-layer" aria-label="3D LUT preview" hidden></canvas>
+            <canvas id="monitor-pixel-overlay" class="monitor-layer" aria-hidden="true" hidden></canvas>
+            <canvas id="monitor-guides-overlay" class="monitor-layer" aria-hidden="true" hidden></canvas>
+            <canvas id="monitor-histogram" class="monitor-histogram" aria-hidden="true" hidden></canvas>
+            <canvas id="monitor-waveform" class="monitor-waveform" aria-hidden="true" hidden></canvas>
+            <div id="viewfinder-placeholder" class="viewfinder-placeholder">
+              <span class="icon large" data-icon="camera" aria-hidden="true"></span>
+              <button id="live-toggle-button" class="button primary" type="button">
+                <span class="icon" data-icon="play" aria-hidden="true"></span>
+                <span data-i18n="startLiveView">Start Live View</span>
+              </button>
+            </div>
+            <div class="viewfinder-overlay top-left">
+              <span id="mode-indicator" class="overlay-label">M</span>
+              <span id="preview-source-indicator" class="overlay-label">CAM</span>
+              <span id="frame-indicator" class="overlay-label">0 FPS</span>
+            </div>
+            <div id="record-indicator" class="record-indicator" hidden>
+              <span aria-hidden="true"></span> REC
+            </div>
+            <div id="bulb-indicator" class="bulb-indicator" hidden>BULB 00:00</div>
+            <div id="temperature-warning" class="temperature-warning" role="status" hidden>
+              <span class="icon" data-icon="triangle-alert" aria-hidden="true"></span>
+              <span id="temperature-warning-text"></span>
+            </div>
+            <button id="live-magnification-button" class="viewfinder-action" type="button" hidden>
+              <span class="icon" data-icon="zoom-in" aria-hidden="true"></span>
+              <span id="live-magnification-label">5x</span>
+            </button>
+            <button id="rtp-audio-button" class="viewfinder-action rtp-audio-action" type="button"
+              data-i18n-aria="cameraAudioUnmute" aria-pressed="false" hidden>
+              <span class="icon" data-icon="volume-x" aria-hidden="true"></span>
+            </button>
+            <div id="focus-reticle" class="focus-reticle" aria-hidden="true" hidden></div>
+            <div id="capture-flash" class="capture-flash" aria-hidden="true"></div>
+          </div>
+
+          <div id="exposure-strip" class="exposure-strip" aria-label="Exposure controls" data-i18n-aria="exposureControls"></div>
+        </section>
+
+        <aside class="control-rail">
+          <div class="capture-mode" role="group" aria-label="Capture mode" data-i18n-aria="captureMode">
+            <button id="photo-mode-button" class="active" type="button" data-mode="photo" data-i18n="photo">Photo</button>
+            <button id="video-mode-button" type="button" data-mode="video" data-i18n="video">Video</button>
+          </div>
+
+          <div class="shutter-zone">
+            <button id="shutter-button" class="shutter-button" type="button" data-i18n-aria="capture">
+              <span class="shutter-inner"><span class="icon" data-icon="camera" aria-hidden="true"></span></span>
+            </button>
+            <strong id="shutter-label" data-i18n="capture">Capture</strong>
+            <span id="operation-state" class="supporting" data-i18n="ready">Ready</span>
+          </div>
+
+          <button id="latest-media-button" class="latest-media-button" type="button" hidden>
+            <span id="latest-media-thumbnail" class="latest-media-thumbnail" aria-hidden="true">
+              <span class="icon" data-icon="images"></span>
+            </span>
+            <span class="latest-media-copy">
+              <span class="supporting" data-i18n="latestMedia">Latest media</span>
+              <strong id="latest-media-label" data-i18n="latestMediaEmpty">No recent media</strong>
+            </span>
+          </button>
+
+          <div class="quick-actions">
+            <button id="autofocus-button" class="button secondary" type="button">
+              <span class="icon" data-icon="focus" aria-hidden="true"></span><span data-i18n="autofocus">AF-ON</span>
+            </button>
+            <button id="half-press-button" class="button secondary" type="button">
+              <span class="icon" data-icon="camera" aria-hidden="true"></span><span data-i18n="halfPress">Half-press</span>
+            </button>
+            <button id="rail-live-button" class="button secondary" type="button">
+              <span class="icon" data-icon="play" aria-hidden="true"></span><span data-i18n="liveView">Live View</span>
+            </button>
+          </div>
+
+          <section id="focus-section" class="rail-section">
+            <div class="rail-heading">
+              <h2 data-i18n="manualFocus">Manual focus</h2>
+              <div id="focus-step-control" class="step-control" role="group" aria-label="Focus step" data-i18n-aria="focusStep">
+                <button type="button" data-step="SMALL" data-i18n-aria="focusStepSmall">1</button>
+                <button type="button" data-step="MEDIUM" data-i18n-aria="focusStepMedium" class="active">2</button>
+                <button type="button" data-step="LARGE" data-i18n-aria="focusStepLarge">3</button>
+              </div>
+            </div>
+            <div class="focus-actions">
+              <button id="focus-near-button" class="button secondary" type="button">
+                <span class="icon" data-icon="chevron-left" aria-hidden="true"></span><span data-i18n="near">Near</span>
+              </button>
+              <button id="focus-far-button" class="button secondary" type="button">
+                <span data-i18n="far">Far</span><span class="icon" data-icon="chevron-right" aria-hidden="true"></span>
+              </button>
+            </div>
+          </section>
+
+          <section class="rail-section live-settings">
+            <div class="rail-heading"><h2 data-i18n="liveViewSettings">Live View</h2></div>
+            <label class="setting-row local-preview-setting">
+              <span data-i18n="previewInput">Preview input</span>
+              <select id="preview-input-select">
+                <option value="CAMERA" data-i18n="cameraLiveView">Camera Live View</option>
+                <option value="LOCAL_VIDEO" data-i18n="localVideoInput">Local video input</option>
+              </select>
+            </label>
+            <label id="local-video-device-row" class="setting-row local-preview-setting" hidden>
+              <span data-i18n="videoDevice">Video device</span>
+              <select id="local-video-device-select">
+                <option value="" data-i18n="systemDefault">System default</option>
+              </select>
+            </label>
+            <p id="local-video-support" class="supporting rail-support" hidden></p>
+            <label id="live-source-row" class="setting-row" hidden>
+              <span data-i18n="liveViewSource">Source</span>
+              <select id="live-source-select"></select>
+            </label>
+            <label id="fps-row" class="setting-row">
+              <span data-i18n="frameRate">Frame rate</span>
+              <select id="fps-select"></select>
+            </label>
+            <label id="tap-action-row" class="setting-row" hidden>
+              <span data-i18n="tapAction">Viewfinder tap</span>
+              <select id="tap-action-select">
+                <option value="focus" data-i18n="tapActionFocus">Focus</option>
+                <option value="whiteBalance" data-i18n="tapActionWhiteBalance">White balance</option>
+              </select>
+            </label>
+            <button id="monitoring-button" class="button secondary rail-setting-button" type="button">
+              <span class="icon" data-icon="focus" aria-hidden="true"></span>
+              <span data-i18n="monitoringAssists">Monitoring assists</span>
+            </button>
+          </section>
+
+          <section class="rail-section">
+            <div class="rail-heading"><h2 data-i18n="moreSettings">More settings</h2></div>
+            <div id="advanced-settings" class="settings-list"></div>
+          </section>
+        </aside>
+      </main>
+
+      <main id="media-panel" class="content-panel view-panel" hidden>
+        <div class="content-heading">
+          <div><h2 data-i18n="media">Media</h2><p id="media-summary" class="supporting"></p></div>
+          <div class="content-actions">
+            <input id="media-upload-input" type="file" accept=".jpg,.jpeg,.png,.webp,.gif,.heic,.heif,.cr2,.cr3,.dng,.mp4,.mov,.m4v,.avi" hidden>
+            <button id="media-upload-button" class="icon-button" type="button" data-i18n-aria="uploadMedia">
+              <span class="icon" data-icon="upload" aria-hidden="true"></span>
+            </button>
+            <button id="media-refresh-button" class="button secondary" type="button">
+              <span class="icon" data-icon="refresh-cw" aria-hidden="true"></span><span data-i18n="refresh">Refresh</span>
+            </button>
+          </div>
+        </div>
+        <div class="media-toolbar">
+          <div id="media-scope-control" class="media-filter-control media-scope-control" role="group" data-i18n-aria="mediaScope">
+            <button type="button" data-media-scope="recent" data-i18n="mediaRecent" aria-pressed="true">Recent</button>
+            <button type="button" data-media-scope="all" data-i18n="mediaFullCard" aria-pressed="false">Full card</button>
+          </div>
+          <div id="media-filter-control" class="media-filter-control" role="group" data-i18n-aria="mediaFilter">
+            <button type="button" data-media-filter="all" data-i18n="mediaAll" aria-pressed="true">All</button>
+            <button type="button" data-media-filter="photo" data-i18n="mediaPhotos" aria-pressed="false">Photos</button>
+            <button type="button" data-media-filter="video" data-i18n="mediaVideos" aria-pressed="false">Videos</button>
+          </div>
+          <label class="media-sort-control">
+            <span class="sr-only" data-i18n="mediaSort">Sort media</span>
+            <select id="media-sort-select" data-i18n-aria="mediaSort">
+              <option value="newest" data-i18n="mediaNewest" selected>Newest first</option>
+              <option value="oldest" data-i18n="mediaOldest">Oldest first</option>
+              <option value="name" data-i18n="mediaName">File name</option>
+              <option value="camera" data-i18n="mediaCameraOrder">Camera order</option>
+            </select>
+          </label>
+          <nav id="media-pagination" class="media-pagination" data-i18n-aria="mediaPages" hidden>
+            <button id="media-page-previous" class="icon-button" type="button" data-i18n-aria="previousMediaPage">
+              <span class="icon" data-icon="chevron-left" aria-hidden="true"></span>
+            </button>
+            <span id="media-page-status" class="supporting" aria-live="polite"></span>
+            <button id="media-page-next" class="icon-button" type="button" data-i18n-aria="nextMediaPage">
+              <span class="icon" data-icon="chevron-right" aria-hidden="true"></span>
+            </button>
+          </nav>
+        </div>
+        <section id="media-transfer" class="media-transfer" aria-live="polite" hidden>
+          <span class="media-transfer-icon icon" data-icon="download" aria-hidden="true"></span>
+          <div class="media-transfer-copy">
+            <strong id="media-transfer-name"></strong>
+            <span id="media-transfer-status" class="supporting"></span>
+            <progress id="media-transfer-progress" max="1"></progress>
+          </div>
+          <button id="media-transfer-cancel" class="icon-button" type="button" data-i18n-aria="cancelDownload">
+            <span class="icon" data-icon="x" aria-hidden="true"></span>
+          </button>
+        </section>
+        <div id="media-list" class="media-list"></div>
+      </main>
+
+      <main id="diagnostics-panel" class="content-panel view-panel" hidden>
+        <div class="content-heading">
+          <div><h2 data-i18n="diagnostics">Diagnostics</h2><p class="supporting" data-i18n="diagnosticSafe">Authentication secrets and camera serial are excluded</p></div>
+          <div class="content-actions">
+            <button id="diagnostics-refresh-button" class="button secondary" type="button">
+              <span class="icon" data-icon="refresh-cw" aria-hidden="true"></span><span data-i18n="refresh">Refresh</span>
+            </button>
+            <button id="copy-diagnostics-button" class="button secondary" type="button">
+              <span class="icon" data-icon="copy" aria-hidden="true"></span><span data-i18n="copy">Copy</span>
+            </button>
+          </div>
+        </div>
+        <section class="diagnostic-validation" aria-labelledby="physical-validation-title">
+          <h3 id="physical-validation-title" data-i18n="physicalValidation">Physical validation</h3>
+          <p class="supporting" data-i18n="physicalValidationHint">Only camera-advertised features observed successfully in this connection can be confirmed.</p>
+          <p id="physical-validation-status" class="supporting"></p>
+          <div id="physical-validation-list" class="physical-validation-list"></div>
+          <button id="copy-physical-validation-button" class="button secondary" type="button">
+            <span class="icon" data-icon="clipboard-check" aria-hidden="true"></span><span data-i18n="copyPhysicalValidation">Copy physical validation record</span>
+          </button>
+        </section>
+        <pre id="diagnostics-output" tabindex="0"></pre>
+      </main>
+    </section>
+  </div>
+
+  <dialog id="monitoring-dialog" class="setting-dialog monitoring-dialog" aria-labelledby="monitoring-dialog-title">
+    <div class="dialog-heading">
+      <h2 id="monitoring-dialog-title" data-i18n="monitoringAssists">Monitoring assists</h2>
+      <button id="monitoring-dialog-close" class="icon-button" type="button" data-i18n-aria="close">
+        <span class="icon" data-icon="x" aria-hidden="true"></span>
+      </button>
+    </div>
+    <div class="monitoring-options">
+      <label class="monitoring-row">
+        <span data-i18n="histogram">Histogram</span>
+        <input id="monitor-histogram-toggle" type="checkbox">
+      </label>
+      <label class="monitoring-row">
+        <span data-i18n="lumaWaveform">Luma waveform</span>
+        <input id="monitor-waveform-toggle" type="checkbox">
+      </label>
+      <div class="monitoring-lut-row">
+        <div>
+          <strong data-i18n="lutPreview">3D LUT preview</strong>
+          <span id="monitor-lut-summary" class="supporting" data-i18n="noLutLoaded">No LUT loaded</span>
+        </div>
+        <div class="monitoring-lut-actions">
+          <input id="monitor-lut-file" type="file" accept=".cube,text/plain" hidden>
+          <button id="monitor-lut-load" class="button secondary" type="button">
+            <span class="icon" data-icon="download" aria-hidden="true"></span><span data-i18n="loadCubeLut">Load .cube LUT</span>
+          </button>
+          <button id="monitor-lut-remove" class="icon-button danger" type="button" data-i18n-aria="removeLut" hidden>
+            <span class="icon" data-icon="trash-2" aria-hidden="true"></span>
+          </button>
+        </div>
+      </div>
+      <label class="monitoring-row">
+        <span data-i18n="zebra">Zebra</span>
+        <select id="monitor-zebra-select">
+          <option value="" data-i18n="off">Off</option>
+          <option value="70">70%</option>
+          <option value="75">75%</option>
+          <option value="80">80%</option>
+          <option value="85">85%</option>
+          <option value="90">90%</option>
+          <option value="95">95%</option>
+          <option value="100">100%</option>
+        </select>
+      </label>
+      <label class="monitoring-row">
+        <span data-i18n="falseColor">False color</span>
+        <input id="monitor-false-color-toggle" type="checkbox">
+      </label>
+      <label class="monitoring-row">
+        <span data-i18n="focusPeaking">Focus peaking</span>
+        <input id="monitor-focus-peaking-toggle" type="checkbox">
+      </label>
+      <div class="monitoring-divider" aria-hidden="true"></div>
+      <label class="monitoring-row">
+        <span data-i18n="frameGuide">Frame guide</span>
+        <select id="monitor-frame-guide-select">
+          <option value="" data-i18n="off">Off</option>
+          <option value="16:9">16:9</option>
+          <option value="2.39:1">2.39:1</option>
+          <option value="1:1">1:1</option>
+          <option value="4:3">4:3</option>
+        </select>
+      </label>
+      <label class="monitoring-row">
+        <span data-i18n="safeArea">Action and title safe areas</span>
+        <input id="monitor-safe-area-toggle" type="checkbox">
+      </label>
+      <label class="monitoring-row">
+        <span data-i18n="anamorphicDesqueeze">Anamorphic desqueeze</span>
+        <select id="monitor-desqueeze-select">
+          <option value="1" data-i18n="off">Off</option>
+          <option value="1.33">1.33x</option>
+          <option value="1.5">1.50x</option>
+          <option value="1.8">1.80x</option>
+          <option value="2">2.00x</option>
+        </select>
+      </label>
+    </div>
+  </dialog>
+
+  <dialog id="setting-dialog" class="setting-dialog">
+    <div class="dialog-heading">
+      <div><span id="setting-dialog-group" class="eyebrow"></span><h2 id="setting-dialog-title"></h2></div>
+      <button id="setting-dialog-close" class="icon-button" type="button" data-i18n-aria="close">
+        <span class="icon" data-icon="x" aria-hidden="true"></span>
+      </button>
+    </div>
+    <div id="setting-options" class="setting-options"></div>
+  </dialog>
+
+  <dialog id="media-preview-dialog" class="media-preview-dialog" aria-labelledby="media-preview-title">
+    <div class="media-preview-heading">
+      <button id="media-preview-close" class="icon-button" type="button" data-i18n-aria="closeMediaPreview">
+        <span class="icon" data-icon="x" aria-hidden="true"></span>
+      </button>
+      <div class="media-preview-heading-copy">
+        <strong id="media-preview-title"></strong>
+        <span id="media-preview-meta" class="supporting"></span>
+      </div>
+      <div class="media-preview-heading-actions">
+        <span id="media-preview-kind" class="supporting"></span>
+        <button id="media-preview-download" class="icon-button" type="button" data-i18n-aria="downloadOriginal" hidden>
+          <span class="icon" data-icon="download" aria-hidden="true"></span>
+        </button>
+        <button id="media-preview-details" class="icon-button" type="button" data-i18n-aria="openMediaDetails" hidden>
+          <span class="icon" data-icon="ellipsis-vertical" aria-hidden="true"></span>
+        </button>
+      </div>
+    </div>
+    <div id="media-preview-stage" class="media-preview-stage">
+      <img id="media-preview-image" alt="" hidden>
+      <video id="media-preview-video" controls playsinline preload="metadata" hidden></video>
+      <button id="media-preview-previous" class="icon-button media-preview-navigation previous" type="button" data-i18n-aria="previousMedia">
+        <span class="icon" data-icon="chevron-left" aria-hidden="true"></span>
+      </button>
+      <button id="media-preview-next" class="icon-button media-preview-navigation next" type="button" data-i18n-aria="nextMedia">
+        <span class="icon" data-icon="chevron-right" aria-hidden="true"></span>
+      </button>
+      <div id="media-preview-loading" class="media-preview-message" data-i18n="loadingPreview">Loading camera preview</div>
+      <div id="media-preview-unavailable" class="media-preview-message" hidden>
+        <p id="media-preview-unavailable-copy" data-i18n="previewUnavailable">The camera preview could not be displayed.</p>
+        <div class="media-preview-recovery-actions">
+          <button id="media-preview-retry" class="button secondary" type="button" hidden>
+            <span class="icon" data-icon="refresh-cw" aria-hidden="true"></span><span data-i18n="tryVideoAgain">Try video again</span>
+          </button>
+          <button id="media-preview-failure-download" class="button secondary" type="button" hidden>
+            <span class="icon" data-icon="download" aria-hidden="true"></span><span data-i18n="downloadOriginal">Download original</span>
+          </button>
+        </div>
+      </div>
+      <button id="media-preview-reset-zoom" class="icon-button media-preview-reset-zoom" type="button" data-i18n-aria="resetMediaZoom" hidden>
+        <span class="icon" data-icon="refresh-cw" aria-hidden="true"></span>
+      </button>
+    </div>
+  </dialog>
+
+  <dialog id="media-details-dialog" class="setting-dialog media-details-dialog" aria-labelledby="media-details-name">
+    <div class="dialog-heading media-details-heading">
+      <div>
+        <span id="media-details-kind" class="eyebrow"></span>
+        <h2 id="media-details-name" data-i18n="mediaDetails">Media details</h2>
+        <span id="media-details-summary" class="supporting"></span>
+      </div>
+      <button id="media-details-close" class="icon-button" type="button" data-i18n-aria="closeMediaDetails">
+        <span class="icon" data-icon="x" aria-hidden="true"></span>
+      </button>
+    </div>
+    <div class="media-details-options">
+      <p id="media-details-loading" class="supporting" data-i18n="loadingMediaDetails" aria-live="polite" hidden>Reading metadata from the camera</p>
+      <section id="media-protection-section" class="media-metadata-section">
+        <h3 data-i18n="protection">Protection</h3>
+        <div class="media-choice-group two" role="group" data-i18n-aria="protection">
+          <button id="media-protect-button" type="button" data-i18n="protect">Protect</button>
+          <button id="media-unprotect-button" type="button" data-i18n="unprotect">Unprotect</button>
+        </div>
+      </section>
+      <section id="media-rating-section" class="media-metadata-section">
+        <h3 data-i18n="rating">Rating</h3>
+        <div id="media-rating-control" class="media-choice-group six" role="group" data-i18n-aria="rating">
+          <button type="button" data-media-rating="0" data-i18n="ratingOff">Off</button>
+          <button type="button" data-media-rating="1">1</button>
+          <button type="button" data-media-rating="2">2</button>
+          <button type="button" data-media-rating="3">3</button>
+          <button type="button" data-media-rating="4">4</button>
+          <button type="button" data-media-rating="5">5</button>
+        </div>
+      </section>
+      <section id="media-rotation-section" class="media-metadata-section">
+        <h3 data-i18n="rotation">Display rotation</h3>
+        <div id="media-rotation-control" class="media-choice-group four" role="group" data-i18n-aria="rotation">
+          <button type="button" data-media-rotation="0">0°</button>
+          <button type="button" data-media-rotation="90">90°</button>
+          <button type="button" data-media-rotation="180">180°</button>
+          <button type="button" data-media-rotation="270">270°</button>
+        </div>
+      </section>
+      <section id="media-archive-section" class="media-metadata-section">
+        <h3 data-i18n="archive">Archive</h3>
+        <div class="media-choice-group two" role="group" data-i18n-aria="archive">
+          <button id="media-archive-button" type="button" data-i18n="archive">Archive</button>
+          <button id="media-unarchive-button" type="button" data-i18n="unarchive">Unarchive</button>
+        </div>
+      </section>
+      <div class="media-details-actions">
+        <button id="media-details-download" class="button secondary" type="button">
+          <span class="icon" data-icon="download" aria-hidden="true"></span><span data-i18n="download">Download</span>
+        </button>
+        <button id="media-details-delete" class="button danger" type="button">
+          <span class="icon" data-icon="trash-2" aria-hidden="true"></span><span data-i18n="delete">Delete</span>
+        </button>
+      </div>
+    </div>
+  </dialog>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+  <script src="/app/icons.js"></script>
+  <script src="/app/diagnostics.js"></script>
+  <script src="/app/monitoring.js"></script>
+  <script src="/app/lut.js"></script>
+  <script src="/app/local-video.js"></script>
+  <script src="/app/rtp-audio.js"></script>
+  <script src="/app/media-transfer.js"></script>
+  <script src="/app/media-library.js"></script>
+  <script src="/app/app.js"></script>
+</body>
+</html>

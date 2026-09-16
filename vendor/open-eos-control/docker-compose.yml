@@ -1,0 +1,6 @@
+services:
+  simulator:
+    build:
+      context: ./simulator
+    ports:
+      - "18080:18080"

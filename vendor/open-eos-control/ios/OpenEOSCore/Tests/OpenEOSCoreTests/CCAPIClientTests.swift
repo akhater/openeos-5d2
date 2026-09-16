@@ -1,0 +1,4036 @@
+import Foundation
+import XCTest
+
+@testable import OpenEOSCore
+
+final class CCAPIClientTests: XCTestCase {
+    func testSimulatorMediaListPublishesItsCompleteResult() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi/media",
+            body: #"{"items":[{"id":"SIM_0001.JPG","name":"SIM_0001.JPG","kind":"image"}]}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://127.0.0.1:18080",
+            mode: .simulator,
+            transport: transport
+        )
+        let progress = MediaListProgressRecorder()
+
+        let items = try await client.listMedia { partialItems in
+            await progress.record(partialItems)
+        }
+
+        XCTAssertEqual(items.map(\.name), ["SIM_0001.JPG"])
+        let snapshots = await progress.values()
+        XCTAssertEqual(snapshots, [items])
+    }
+
+    func testSimulatorMediaListHonorsMaximumItems() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi/media",
+            body: #"{"items":[{"id":"SIM_0001.JPG","name":"SIM_0001.JPG","kind":"image"},{"id":"SIM_0002.JPG","name":"SIM_0002.JPG","kind":"image"},{"id":"SIM_0003.JPG","name":"SIM_0003.JPG","kind":"image"}]}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://127.0.0.1:18080",
+            mode: .simulator,
+            transport: transport
+        )
+        let progress = MediaListProgressRecorder()
+
+        let items = try await client.listMedia(maximumItems: 2) { partialItems in
+            await progress.record(partialItems)
+        }
+
+        XCTAssertEqual(items.map(\.name), ["SIM_0001.JPG", "SIM_0002.JPG"])
+        let snapshots = await progress.values()
+        XCTAssertEqual(snapshots.map(\.count), [2])
+    }
+
+    func testMediaListRejectsNonPositiveMaximumItems() async throws {
+        let client = try CCAPIClient(
+            baseURL: "http://127.0.0.1:18080",
+            mode: .simulator,
+            transport: MockCameraHTTPTransport()
+        )
+
+        for maximumItems in [0, -1] {
+            do {
+                _ = try await client.listMedia(maximumItems: maximumItems)
+                XCTFail("Expected maximumItems=\(maximumItems) to be rejected")
+            } catch {
+                XCTAssertEqual(
+                    error as? CCAPIError,
+                    .invalidResponse("maximumItems must be greater than zero.")
+                )
+            }
+        }
+    }
+
+    func testDirectCCAPIUploadIsExplicitlyUnsupported() async throws {
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera)
+        do {
+            _ = try await client.uploadMedia(from: URL(fileURLWithPath: "/tmp/test.jpg"))
+            XCTFail("Expected direct CCAPI upload to be unsupported")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .unsupported(.mediaUpload))
+        }
+    }
+    private let discovery = """
+    {
+      "ver100": [
+        {"path":"/deviceinformation","get":true},
+        {"path":"/devicestatus/batterylist","get":true},
+        {"path":"/devicestatus/storage","get":true},
+        {"path":"/shooting/settings","get":true},
+        {"path":"/shooting/settings/iso","put":true},
+        {"path":"/shooting/settings/tv","put":true},
+        {"path":"/shooting/settings/av","put":true},
+        {"path":"/shooting/settings/wb","put":true},
+        {"path":"/shooting/settings/stillimagequality","put":true},
+        {"path":"/shooting/settings/wbshift","put":true},
+        {"path":"/shooting/settings/meteringmode","put":true},
+        {"path":"/functions/datetime","get":true,"put":true},
+        {"path":"/shooting/control/shutterbutton","post":true},
+        {"path":"/shooting/control/shutterbutton/manual","put":true},
+        {"path":"/shooting/control/af","post":true},
+        {"path":"/shooting/control/recbutton","post":true},
+        {"path":"/shooting/liveview/afframeposition","put":true},
+        {"path":"/shooting/liveview/clickwb","post":true},
+        {"path":"/shooting/control/drivefocus","post":true},
+        {"path":"/shooting/liveview","get":true,"post":true,"delete":true},
+        {"path":"/shooting/liveview/flip","get":true},
+        {"path":"/shooting/liveview/flipdetail","get":true},
+        {"path":"/contents","get":true,"put":true,"delete":true}
+      ]
+    }
+    """
+
+    private let settings = """
+    {
+      "iso":{"value":"800","ability":["100","800","1600"]},
+      "tv":{"value":"1/50","ability":["1/50","1/100"]},
+      "av":{"value":"2.8","ability":["2.8","4.0"]},
+      "wb":{"value":"auto","ability":["auto","daylight"]},
+      "meteringmode":{"value":"evaluative","ability":["evaluative","spot"]},
+      "stillimagequality":{
+        "value":{"raw":"none","jpeg":"large_fine"},
+        "ability":{"raw":["none","raw","craw"],"jpeg":["none","large_fine","large_normal"]}
+      },
+      "wbshift":{
+        "value":{"ba":0,"mg":0},
+        "ability":{"ba":{"min":-9,"max":9,"step":1},"mg":{"min":-9,"max":9,"step":1}}
+      },
+      "readonly":{"value":"fixed","ability":["fixed"]}
+    }
+    """
+
+    private let postOnlyLiveViewDiscovery = """
+    {
+      "ver130":[
+        {"path":"/shooting/liveview","post":true},
+        {"path":"/shooting/liveview/flip","get":true}
+      ]
+    }
+    """
+
+    private let deviceStatusDiscovery = #"{"ver100":[{"path":"/devicestatus/batterylist","get":true},{"path":"/devicestatus/storage","get":true},{"path":"/shooting/information/recordable","get":true},{"path":"/devicestatus/lens","get":true},{"path":"/devicestatus/temperature","get":true},{"path":"/shooting/settings","get":true},{"path":"/shooting/control/shutterbutton","post":true},{"path":"/shooting/control/recbutton","post":true}]}"#
+
+    private let fileNamingDiscovery = #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/functions/filename/stills/filename","get":true,"put":true},{"path":"/functions/filename/stills/usersetting1","get":true,"put":true},{"path":"/functions/filename/stills/usersetting2","get":true,"put":true},{"path":"/functions/filename/movies/index","get":true,"put":true},{"path":"/functions/filename/movies/reelnum","get":true,"put":true},{"path":"/functions/filename/movies/clipnum","get":true,"put":true},{"path":"/functions/filename/movies/userdefined","get":true,"put":true}]}"#
+
+    func testDiscoverySnapshotBuildsCapabilitiesFromAdvertisedOperations() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/deviceinformation",
+            body: #"{"productname":"Canon EOS R6 Mark III","serialnumber":"TEST-SERIAL-0001","version":"1.4.0"}"#
+        )
+        await enqueueStatus(on: transport)
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let snapshot = try await client.connectSnapshot()
+
+        XCTAssertEqual(snapshot.info.model, "Canon EOS R6 Mark III")
+        XCTAssertEqual(snapshot.status.batteryLevel, 89)
+        XCTAssertEqual(snapshot.status.exposure.shutter, "1/50")
+        XCTAssertEqual(snapshot.status.storageTotalBytes, 192_000_000_000)
+        XCTAssertEqual(snapshot.status.storageFreeBytes, 96_000_000_000)
+        XCTAssertEqual(snapshot.status.storageFreeImages, 2_400)
+        XCTAssertEqual(snapshot.status.storageDeviceCount, 2)
+        XCTAssertEqual(snapshot.capabilities.profile.priority, .primary)
+        XCTAssertEqual(snapshot.capabilities.setting("iso")?.values, ["100", "800", "1600"])
+        XCTAssertEqual(snapshot.capabilities.setting("meteringmode")?.values, ["evaluative", "spot"])
+        XCTAssertEqual(snapshot.capabilities.setting("stillimagequality.raw")?.values, ["none", "raw", "craw"])
+        XCTAssertEqual(snapshot.capabilities.setting("stillimagequality.jpeg")?.value, "large_fine")
+        XCTAssertEqual(snapshot.capabilities.setting("wbshift.ba")?.values, (-9...9).map(String.init))
+        XCTAssertNil(snapshot.capabilities.setting("readonly"))
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.stillCapture))
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.bulbExposure))
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.shutterHalfPress))
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.videoRecording))
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.tapFocus))
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.clickWhiteBalance))
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.mediaDownload))
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.mediaDelete))
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.mediaProtect))
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.mediaRating))
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.mediaRotate))
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.mediaArchive))
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.mediaThumbnail))
+        XCTAssertFalse(snapshot.capabilities.matrix.planned.contains(.mediaThumbnail))
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.mediaPreview))
+        XCTAssertFalse(snapshot.capabilities.matrix.planned.contains(.mediaPreview))
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.focusDrive))
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.cameraClockSync))
+        let directCCAPIFeatures = Set(CameraFeature.allCases).subtracting([.desktopBridge, .usbDiagnostics])
+        XCTAssertEqual(
+            snapshot.capabilities.matrix.supported.union(snapshot.capabilities.matrix.planned),
+            directCCAPIFeatures
+        )
+        XCTAssertTrue(snapshot.capabilities.matrix.supported.isDisjoint(with: snapshot.capabilities.matrix.planned))
+        XCTAssertTrue(snapshot.capabilities.matrix.planned.contains(.mediaUpload))
+        XCTAssertEqual(snapshot.capabilities.evidence.source, "GET /ccapi")
+        XCTAssertEqual(snapshot.capabilities.evidence.protocolVersions, ["ver100"])
+        XCTAssertTrue(
+            snapshot.capabilities.evidence.advertisedCommands.contains(
+                "POST /ccapi/ver100/shooting/control/shutterbutton"
+            )
+        )
+        XCTAssertTrue(snapshot.capabilities.evidence.writableSettings.contains("iso"))
+        XCTAssertFalse(snapshot.capabilities.evidence.truncated)
+        let remainingResponses = await transport.remainingResponses()
+        XCTAssertEqual(remainingResponses, 0)
+    }
+
+    func testDiscoveryLoadsCanonDeveloperAPIListWhenRootOmitsOperations() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: #"{"value":"No list of APIs"}"#)
+        await transport.enqueueJSON(path: "/ccapi/ver100/topurlfordev", body: discovery)
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: settings)
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        try await client.initialize()
+        let capabilities = try await client.capabilities()
+
+        XCTAssertTrue(capabilities.matrix.supports(.stillCapture))
+        XCTAssertTrue(capabilities.matrix.supports(.videoRecording))
+        XCTAssertTrue(capabilities.matrix.supports(.mediaBrowser))
+        XCTAssertEqual(
+            capabilities.evidence.source,
+            "GET /ccapi/ver100/topurlfordev (Canon developer API fallback)"
+        )
+        XCTAssertTrue(
+            capabilities.evidence.advertisedCommands.contains(
+                "POST /ccapi/ver100/shooting/control/shutterbutton"
+            )
+        )
+        XCTAssertEqual(capabilities.evidence.discoveryTrace.map(\.outcome), ["NO_API_LIST", "OPERATIONS"])
+        XCTAssertEqual(
+            capabilities.evidence.discoveryTrace.map(\.endpoint),
+            ["GET /ccapi", "GET /ccapi/ver100/topurlfordev"]
+        )
+        XCTAssertGreaterThan(capabilities.evidence.discoveryTrace.last?.advertisedOperationCount ?? 0, 0)
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map(\.path), [
+            "/ccapi",
+            "/ccapi/ver100/topurlfordev",
+            "/ccapi/ver100/shooting/settings",
+        ])
+    }
+
+    func testDiscoveryLoadsDeveloperAPIListWhenFirmwareReturnsVersionWithoutCommands() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"api":["/ccapi/ver100"],"version":"ver100","ver100":[]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/topurlfordev", body: discovery)
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: settings)
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        try await client.initialize()
+        let capabilities = try await client.capabilities()
+
+        XCTAssertTrue(capabilities.matrix.supports(.liveView))
+        XCTAssertTrue(capabilities.matrix.supports(.stillCapture))
+        XCTAssertTrue(capabilities.matrix.supports(.videoRecording))
+        XCTAssertFalse(capabilities.evidence.advertisedCommands.isEmpty)
+        XCTAssertEqual(
+            capabilities.evidence.source,
+            "GET /ccapi/ver100/topurlfordev (Canon developer API fallback)"
+        )
+        XCTAssertEqual(capabilities.evidence.discoveryTrace.map(\.outcome), ["ZERO_OPERATIONS", "OPERATIONS"])
+        XCTAssertEqual(capabilities.evidence.discoveryTrace.first?.protocolVersions, ["ver100"])
+        XCTAssertEqual(capabilities.evidence.discoveryTrace.first?.advertisedOperationCount, 0)
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map(\.path), [
+            "/ccapi",
+            "/ccapi/ver100/topurlfordev",
+            "/ccapi/ver100/shooting/settings",
+        ])
+    }
+
+    func testDiscoveryRejectsEmptyDeveloperAPIListWithoutInventingCapabilities() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: #"{"ver100":[]}"#)
+        await transport.enqueueJSON(path: "/ccapi/ver100/topurlfordev", body: #"{"ver100":[]}"#)
+        await transport.enqueueJSON(path: "/ccapi/", status: 404, body: "{}")
+        await transport.enqueueJSON(path: "/ccapi/ver110/deviceinformation", status: 404, body: "{}")
+        await transport.enqueueJSON(path: "/ccapi/ver100/deviceinformation", status: 404, body: "{}")
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        do {
+            try await client.initialize()
+            XCTFail("Expected discovery failure")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("did not advertise any valid operations"))
+        }
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map(\.path), [
+            "/ccapi",
+            "/ccapi/ver100/topurlfordev",
+            "/ccapi",
+            "/ccapi/ver110/deviceinformation",
+            "/ccapi/ver100/deviceinformation",
+        ])
+    }
+
+    func testDiscoveryReportsDeveloperAPIFailureWithoutInventingCapabilities() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: #"{"value":"No list of APIs"}"#)
+        await transport.enqueueJSON(path: "/ccapi/ver100/topurlfordev", status: 503, body: "camera busy")
+        await transport.enqueueJSON(path: "/ccapi/", status: 404, body: "{}")
+        await transport.enqueueJSON(path: "/ccapi/ver110/deviceinformation", status: 404, body: "{}")
+        await transport.enqueueJSON(path: "/ccapi/ver100/deviceinformation", status: 404, body: "{}")
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        do {
+            try await client.initialize()
+            XCTFail("Expected discovery failure")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("/ccapi/ver100/topurlfordev"))
+        }
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map(\.path), [
+            "/ccapi",
+            "/ccapi/ver100/topurlfordev",
+            "/ccapi",
+            "/ccapi/ver110/deviceinformation",
+            "/ccapi/ver100/deviceinformation",
+        ])
+    }
+
+    func testDiscoveryTraceRetainsIdentityFallbackWithoutInventingOperations() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", status: 404, body: #"{"message":"missing"}"#)
+        await transport.enqueueJSON(path: "/ccapi", status: 404, body: #"{"message":"missing"}"#)
+        await transport.enqueueJSON(
+            path: "/ccapi/ver110/deviceinformation",
+            body: #"{"productname":"Canon EOS R6 Mark III","serialnumber":"TEST-SERIAL-0001"}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        try await client.initialize()
+        let capabilities = try await client.capabilities()
+
+        XCTAssertEqual(
+            capabilities.evidence.discoveryTrace.map(\.outcome),
+            ["HTTP_ERROR", "HTTP_ERROR", "IDENTITY"]
+        )
+        XCTAssertEqual(capabilities.evidence.discoveryTrace.last?.httpStatus, 200)
+        XCTAssertEqual(
+            capabilities.evidence.discoveryTrace.last?.responseKeys,
+            ["productname", "serialnumber"]
+        )
+        XCTAssertTrue(capabilities.evidence.advertisedCommands.isEmpty)
+        XCTAssertFalse(capabilities.matrix.supports(.stillCapture))
+    }
+
+    func testEventPollingRequiresAdvertisedGetDeleteLifecycle() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver110":[{"path":"/event/polling","get":true,"delete":true}]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver110/event/polling?timeout=long",
+            body: #"{"shootingsettings":{"iso":{"value":"1600"}}}"#
+        )
+        await transport.enqueue(
+            method: "DELETE",
+            path: "/ccapi/ver110/event/polling",
+            status: 204,
+            body: Data()
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        try await client.initialize()
+        let capabilities = try await client.capabilities()
+        let event = try await client.pollEvent()
+        await client.stopEventPolling()
+
+        XCTAssertTrue(capabilities.matrix.supports(.eventPolling))
+        XCTAssertEqual(event.changedKeys, ["shootingsettings"])
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map(\.path), [
+            "/ccapi",
+            "/ccapi/ver110/event/polling?timeout=long",
+            "/ccapi/ver110/event/polling",
+        ])
+        XCTAssertEqual(requests[1].timeoutInterval, 40)
+        XCTAssertEqual(requests[2].timeoutInterval, 5)
+    }
+
+    func testIncompleteEventLifecycleIsPlannedButUnsupported() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver110":[{"path":"/event/polling","get":true}]}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        try await client.initialize()
+        let capabilities = try await client.capabilities()
+
+        XCTAssertFalse(capabilities.matrix.supports(.eventPolling))
+        XCTAssertTrue(capabilities.matrix.planned.contains(.eventPolling))
+        do {
+            _ = try await client.pollEvent()
+            XCTFail("Expected unsupported event polling")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .unsupported(.eventPolling))
+        }
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map(\.path), ["/ccapi"])
+    }
+
+    func testSimulatorEventPollingAdvancesSequence() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi/events?after=0",
+            body: #"{"sequence":2,"keys":["contents","shootingsettings"]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/events?after=2",
+            body: #"{"sequence":2,"keys":[]}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://127.0.0.1:18080",
+            mode: .simulator,
+            transport: transport
+        )
+
+        let first = try await client.pollEvent()
+        let second = try await client.pollEvent()
+
+        XCTAssertEqual(first.changedKeys, ["contents", "shootingsettings"])
+        XCTAssertTrue(second.changedKeys.isEmpty)
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map(\.path), ["/ccapi/events?after=0", "/ccapi/events?after=2"])
+    }
+
+    func testDiscoveryAcceptsSameOriginURLEntriesAndRejectsUnsafeOperations() async throws {
+        let transport = MockCameraHTTPTransport()
+        let fullURLDiscovery = """
+        {
+          "ver100": [
+            {"url":"http://192.168.1.2:8080/ccapi/ver100/deviceinformation","get":true},
+            {"url":"http://192.168.1.2:8080/ccapi/ver100/devicestatus/storage?token=secret","get":true},
+            {"url":"http://192.168.1.2:8080/ccapi/ver100/shooting/settings","get":true},
+            {"url":"http://192.168.1.2:8080/ccapi/ver100/shooting/settings/iso","put":true},
+            {"url":"http://192.168.1.2:8080/ccapi/ver100/shooting/control/shutterbutton","post":true},
+            {"url":"http://attacker.invalid/ccapi/ver100/shooting/control/recbutton","post":true},
+            {"url":"http://192.168.1.2:8080/ccapi/ver100/ignored/../shooting/control/recbutton","post":true}
+          ]
+        }
+        """
+        await transport.enqueueJSON(path: "/ccapi", body: fullURLDiscovery)
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/deviceinformation",
+            body: #"{"productname":"Canon EOS R6 Mark III","serialnumber":"redacted","version":"1.4.0"}"#
+        )
+        await enqueueStatus(on: transport)
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let snapshot = try await client.connectSnapshot()
+
+        XCTAssertEqual(snapshot.status.mediaAvailable, true)
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.storageStatus))
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.exposureControl))
+        XCTAssertTrue(snapshot.capabilities.matrix.supports(.stillCapture))
+        XCTAssertFalse(snapshot.capabilities.matrix.supports(.videoRecording))
+        XCTAssertTrue(
+            snapshot.capabilities.evidence.advertisedCommands.contains(
+                "GET /ccapi/ver100/devicestatus/storage"
+            )
+        )
+        XCTAssertTrue(
+            snapshot.capabilities.evidence.advertisedCommands.contains(
+                "POST /ccapi/ver100/shooting/control/shutterbutton"
+            )
+        )
+        XCTAssertTrue(
+            snapshot.capabilities.evidence.advertisedCommands.allSatisfy {
+                !$0.contains("secret") && !$0.contains("attacker")
+            }
+        )
+        let remainingResponses = await transport.remainingResponses()
+        XCTAssertEqual(remainingResponses, 0)
+    }
+
+    func testDirectCCAPIThumbnailUsesCanonKindQueryAndSniffsImageType() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        let path = "/ccapi/ver100/contents/card1/100CANON/IMG_0001.JPG"
+        let jpeg = Data([0xFF, 0xD8, 0xFF, 0x01, 0xFF, 0xD9])
+        await transport.enqueue(
+            path: "\(path)?kind=thumbnail",
+            headers: ["content-type": "application/octet-stream"],
+            body: jpeg
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+        let item = CameraMediaItem(id: "\(path)?kind=main", name: "IMG_0001.JPG", kind: "image")
+
+        let thumbnail = try await client.mediaThumbnail(item)
+
+        XCTAssertEqual(thumbnail.data, jpeg)
+        XCTAssertEqual(thumbnail.contentType, "image/jpeg")
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map(\.path), ["/ccapi", "\(path)?kind=thumbnail"])
+    }
+
+    func testDirectCCAPIThumbnailRejectsOversizedResponse() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        let path = "/ccapi/ver100/contents/card1/100CANON/IMG_0001.JPG"
+        await transport.enqueue(
+            path: "\(path)?kind=thumbnail",
+            headers: ["content-type": "image/jpeg"],
+            body: Data(repeating: 0x01, count: 8 * 1024 * 1024 + 1)
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        do {
+            _ = try await client.mediaThumbnail(CameraMediaItem(id: path, name: "IMG_0001.JPG", kind: "image"))
+            XCTFail("Expected bounded thumbnail failure")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("exceeded"))
+        }
+    }
+
+    func testDirectCCAPIThumbnailRejectsCrossOriginBeforeFetching() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+        let value = "http://attacker.invalid/ccapi/ver100/contents/IMG_0001.JPG"
+
+        do {
+            _ = try await client.mediaThumbnail(CameraMediaItem(id: value, name: "IMG_0001.JPG", kind: "image"))
+            XCTFail("Expected same-origin validation")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .outsideCameraOrigin(value))
+        }
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map(\.path), ["/ccapi"])
+    }
+
+    func testDirectCCAPIPreviewUsesCanonDisplayQueryAndRejectsVideo() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        let path = "/ccapi/ver100/contents/card1/100CANON/IMG_0001.JPG"
+        let jpeg = Data([0xFF, 0xD8, 0xFF, 0x02, 0xFF, 0xD9])
+        await transport.enqueue(
+            path: "\(path)?kind=display",
+            headers: ["content-type": "application/octet-stream"],
+            body: jpeg
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let preview = try await client.mediaPreview(
+            CameraMediaItem(id: "\(path)?kind=main", name: "IMG_0001.CR3", kind: "raw")
+        )
+        XCTAssertEqual(preview.data, jpeg)
+        XCTAssertEqual(preview.contentType, "image/jpeg")
+
+        do {
+            _ = try await client.mediaPreview(CameraMediaItem(id: path, name: "MVI_0001.MP4", kind: "video"))
+            XCTFail("Expected video preview rejection")
+        } catch {
+            XCTAssertEqual(
+                error as? CCAPIError,
+                .invalidResponse("CCAPI display preview is available only for JPEG or CR3 items.")
+            )
+        }
+        do {
+            let pngPath = "/ccapi/ver100/contents/card1/100CANON/IMG_0002.PNG"
+            _ = try await client.mediaPreview(CameraMediaItem(id: pngPath, name: "IMG_0002.PNG", kind: "image"))
+            XCTFail("Expected PNG display preview rejection")
+        } catch {
+            XCTAssertEqual(
+                error as? CCAPIError,
+                .invalidResponse("CCAPI display preview is available only for JPEG or CR3 items.")
+            )
+        }
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map(\.path), ["/ccapi", "\(path)?kind=display"])
+    }
+
+    func testDirectCCAPIPreviewRejectsOversizedResponse() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        let path = "/ccapi/ver100/contents/card1/100CANON/IMG_0001.JPG"
+        await transport.enqueue(
+            path: "\(path)?kind=display",
+            headers: ["content-type": "image/jpeg"],
+            body: Data(repeating: 0x01, count: 32 * 1024 * 1024 + 1)
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        do {
+            _ = try await client.mediaPreview(CameraMediaItem(id: path, name: "IMG_0001.JPG", kind: "image"))
+            XCTFail("Expected bounded preview failure")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("exceeded"))
+        }
+    }
+
+    func testDirectCCAPIMediaStreamUsesAuthenticatedByteRangeWithoutBufferingWholeVideo() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        let path = "/ccapi/ver100/contents/card1/100CANON/MVI_0001.MP4"
+        await transport.enqueue(
+            path: path,
+            status: 206,
+            headers: [
+                "content-type": "video/mp4",
+                "content-length": "16",
+                "content-range": "bytes 1024-1039/8192",
+            ],
+            body: Data(repeating: 0x42, count: 16)
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            username: "camera-user",
+            password: "camera-password",
+            transport: transport
+        )
+
+        let stream = try await client.openMediaStream(
+            CameraMediaItem(id: path, name: "MVI_0001.MP4", kind: "video", sizeBytes: 8192),
+            offset: 1024,
+            length: 16
+        )
+        var data = Data()
+        for try await chunk in stream.chunks { data.append(chunk) }
+
+        XCTAssertEqual(stream.statusCode, 206)
+        XCTAssertEqual(stream.rangeStart, 1024)
+        XCTAssertEqual(stream.contentLength, 16)
+        XCTAssertEqual(stream.totalBytes, 8192)
+        XCTAssertEqual(data, Data(repeating: 0x42, count: 16))
+        let requests = await transport.requests()
+        let request = try XCTUnwrap(requests.last)
+        XCTAssertEqual(request.headers.first { $0.key.caseInsensitiveCompare("Range") == .orderedSame }?.value, "bytes=1024-1039")
+        XCTAssertNotNil(request.headers.first { $0.key.caseInsensitiveCompare("Authorization") == .orderedSame })
+    }
+
+    func testStillCaptureUsesAdvertisedPostAndAutofocusPayload() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        await transport.enqueue(method: "POST", path: "/ccapi/ver100/shooting/control/shutterbutton", status: 204, body: Data())
+        await enqueueStatus(on: transport)
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        _ = try await client.captureStill()
+
+        let requests = await transport.requests()
+        let request = try XCTUnwrap(requests.first { $0.path.contains("shutterbutton") })
+        let body = try XCTUnwrap(request.body)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(json["af"] as? Bool, true)
+        let capabilities = try await client.capabilities()
+        XCTAssertTrue(capabilities.evidence.observedFeatures.contains(.stillCapture))
+    }
+
+    func testClockSyncUsesCanonRFC1123PayloadAndVerifiesReadback() async throws {
+        let transport = MockCameraHTTPTransport()
+        let now = Date()
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = .current
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss Z"
+        let cameraClock = formatter.string(from: now)
+        let daylight = TimeZone.current.isDaylightSavingTime(for: now)
+        let response = "{\"datetime\":\"\(cameraClock)\",\"dst\":\(daylight)}"
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: settings)
+        await transport.enqueueJSON(method: "PUT", path: "/ccapi/ver100/functions/datetime", body: response)
+        await transport.enqueueJSON(path: "/ccapi/ver100/functions/datetime", body: response)
+        await enqueueStatus(on: transport)
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+        let status = try await client.syncCameraClock()
+
+        XCTAssertTrue(capabilities.matrix.supports(.cameraClockSync))
+        XCTAssertTrue(status.connected)
+        let requests = await transport.requests()
+        let write = try XCTUnwrap(requests.first { $0.path.hasSuffix("/functions/datetime") && $0.method == "PUT" })
+        let body = try XCTUnwrap(write.body)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let rawDateTime = try XCTUnwrap(json["datetime"] as? String)
+        XCTAssertNotNil(
+            rawDateTime.range(
+                of: #"^[A-Z][a-z]{2}, \d{2} [A-Z][a-z]{2} \d{4} \d{2}:\d{2}:\d{2} [+-]\d{4}$"#,
+                options: .regularExpression
+            )
+        )
+        XCTAssertNotNil(json["dst"] as? Bool)
+        let observedCapabilities = try await client.capabilities()
+        XCTAssertTrue(observedCapabilities.evidence.observedFeatures.contains(.cameraClockSync))
+    }
+
+    func testClockSyncDoesNotCombineReadAndWriteAcrossAPIVersions() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: """
+            {
+              "ver100": [
+                {"path":"/shooting/settings","get":true},
+                {"path":"/functions/datetime","get":true}
+              ],
+              "ver110": [{"path":"/functions/datetime","put":true}]
+            }
+            """
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: settings)
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertFalse(capabilities.matrix.supports(.cameraClockSync))
+        XCTAssertTrue(capabilities.matrix.planned.contains(.cameraClockSync))
+        do {
+            _ = try await client.syncCameraClock()
+            XCTFail("Expected unsupported camera clock synchronization")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .unsupported(.cameraClockSync))
+        }
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.count, 2)
+    }
+
+    func testSensorCleaningUsesAdvertisedCanonPostAndExactBooleanPayload() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver110":[{"path":"/functions/sensorcleaning","post":true}]}"#
+        )
+        await transport.enqueueJSON(
+            method: "POST",
+            path: "/ccapi/ver110/functions/sensorcleaning",
+            body: "{}"
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+        try await client.cleanSensor(autoPowerOff: true)
+
+        XCTAssertTrue(capabilities.matrix.supports(.sensorCleaning))
+        let requests = await transport.requests()
+        let request = try XCTUnwrap(requests.first { $0.path.hasSuffix("/functions/sensorcleaning") })
+        let body = try XCTUnwrap(request.body)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(json["autopoweroff"] as? Bool, true)
+        let observedCapabilities = try await client.capabilities()
+        XCTAssertTrue(observedCapabilities.evidence.observedFeatures.contains(.sensorCleaning))
+    }
+
+    func testSensorCleaningRejectsNoncanonicalSuccessStatus() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/functions/sensorcleaning","post":true}]}"#
+        )
+        await transport.enqueue(
+            method: "POST",
+            path: "/ccapi/ver100/functions/sensorcleaning",
+            status: 204,
+            body: Data()
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        do {
+            try await client.cleanSensor(autoPowerOff: false)
+            XCTFail("Expected Canon sensor cleaning to require HTTP 200")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("expected HTTP 200"))
+        }
+        let capabilities = try await client.capabilities()
+        XCTAssertFalse(capabilities.evidence.observedFeatures.contains(.sensorCleaning))
+    }
+
+    func testUnadvertisedSensorCleaningFailsWithoutSendingACommand() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/deviceinformation","get":true}]}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        do {
+            try await client.cleanSensor(autoPowerOff: false)
+            XCTFail("Expected unsupported sensor cleaning")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .unsupported(.sensorCleaning))
+        }
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.count, 1)
+        let capabilities = try await client.capabilities()
+        XCTAssertTrue(capabilities.matrix.planned.contains(.sensorCleaning))
+        XCTAssertFalse(capabilities.evidence.observedFeatures.contains(.sensorCleaning))
+    }
+
+    func testSimulatorSensorCleaningUsesBackedEndpoint() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi/capabilities", body: "{}")
+        await transport.enqueue(
+            method: "POST",
+            path: "/ccapi/sensor-cleaning",
+            status: 204,
+            body: Data()
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://127.0.0.1:18080",
+            mode: .simulator,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+        try await client.cleanSensor(autoPowerOff: false)
+
+        XCTAssertTrue(capabilities.matrix.supports(.sensorCleaning))
+        let requests = await transport.requests()
+        let request = try XCTUnwrap(requests.first { $0.path == "/ccapi/sensor-cleaning" })
+        let body = try XCTUnwrap(request.body)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(json["autopoweroff"] as? Bool, false)
+    }
+
+    func testUnadvertisedCaptureFailsWithoutSendingACommand() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: #"{"ver100":[{"path":"/deviceinformation","get":true}]}"#)
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        do {
+            _ = try await client.captureStill()
+            XCTFail("Expected unsupported capture")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .unsupported(.stillCapture))
+        }
+        let requestCount = await transport.requests().count
+        XCTAssertEqual(requestCount, 1)
+        let capabilities = try await client.capabilities()
+        XCTAssertFalse(capabilities.evidence.observedFeatures.contains(.stillCapture))
+    }
+
+    func testFocusDriveUsesAdvertisedPostAndCanonValue() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        await transport.enqueue(
+            method: "POST",
+            path: "/ccapi/ver100/shooting/control/drivefocus",
+            status: 204,
+            body: Data()
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let result = try await client.driveFocus(direction: .far, step: .large)
+
+        XCTAssertEqual(result, FocusDriveResult(accepted: true, direction: .far, step: .large))
+        let requests = await transport.requests()
+        let request = try XCTUnwrap(requests.first { $0.path.contains("drivefocus") })
+        XCTAssertEqual(request.method, "POST")
+        let body = try XCTUnwrap(request.body)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
+        XCTAssertEqual(json, ["value": "far3"])
+    }
+
+    func testSimulatorFocusDriveUsesContractAndIsAdvertised() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi/capabilities",
+            body: #"{"iso":["800"],"shutter":["1/50"],"aperture":["2.8"],"white_balance":["auto"]}"#
+        )
+        await transport.enqueueJSON(
+            method: "POST",
+            path: "/ccapi/focus/drive",
+            body: #"{"ok":true,"direction":"near","step":"large"}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://127.0.0.1:18080",
+            mode: .simulator,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+        let result = try await client.driveFocus(direction: .near, step: .large)
+
+        XCTAssertTrue(capabilities.matrix.supports(.focusDrive))
+        XCTAssertTrue(capabilities.matrix.supports(.bulbExposure))
+        XCTAssertFalse(capabilities.matrix.planned.contains(.focusDrive))
+        XCTAssertEqual(result, FocusDriveResult(accepted: true, direction: .near, step: .large))
+        let requests = await transport.requests()
+        let request = try XCTUnwrap(requests.first { $0.path == "/ccapi/focus/drive" })
+        let body = try XCTUnwrap(request.body)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
+        XCTAssertEqual(json, ["direction": "near", "step": "large"])
+    }
+
+    func testSimulatorLiveViewMagnificationUsesDynamicContract() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi/capabilities",
+            body: #"{"iso":["800"],"shutter":["1/50"],"aperture":["2.8"],"white_balance":["auto"],"liveView":{"magnifications":[1,5,10],"currentMagnification":5}}"#
+        )
+        await transport.enqueueJSON(
+            method: "POST",
+            path: "/ccapi/liveview/magnification",
+            body: #"{"accepted":true,"value":10}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://127.0.0.1:18080",
+            mode: .simulator,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+        try await client.startLiveView()
+        let result = try await client.setLiveViewMagnification(.x10)
+
+        XCTAssertTrue(capabilities.matrix.supports(.liveViewMagnification))
+        XCTAssertEqual(capabilities.liveView.magnifications, [.x1, .x5, .x10])
+        XCTAssertEqual(capabilities.liveView.currentMagnification, .x5)
+        XCTAssertEqual(result.magnification, .x10)
+        let simulatorRequests = await transport.requests()
+        let request = try XCTUnwrap(simulatorRequests.first {
+            $0.path == "/ccapi/liveview/magnification"
+        })
+        let body = try XCTUnwrap(request.body)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Int])
+        XCTAssertEqual(json, ["value": 10])
+    }
+
+    func testUnadvertisedFocusDriveFailsWithoutSendingACommand() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/deviceinformation","get":true}]}"#
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        do {
+            _ = try await client.driveFocus(direction: .near, step: .small)
+            XCTFail("Expected unsupported focus drive")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .unsupported(.focusDrive))
+        }
+        let requestCount = await transport.requests().count
+        XCTAssertEqual(requestCount, 1)
+    }
+
+    func testReadOnlySettingsWrongShutterMethodAndPostOnlyLiveViewRemainDistinct() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/shooting/control/shutterbutton","put":true},{"path":"/shooting/liveview","post":true},{"path":"/shooting/liveview/flip","get":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: settings)
+        await transport.enqueue(method: "POST", path: "/ccapi/ver100/shooting/liveview", status: 204, body: Data())
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let capabilities = try await client.capabilities()
+        let requestCount = await transport.requests().count
+
+        XCTAssertFalse(capabilities.matrix.supports(.exposureControl))
+        XCTAssertFalse(capabilities.matrix.supports(.advancedSettings))
+        XCTAssertFalse(capabilities.matrix.supports(.stillCapture))
+        XCTAssertTrue(capabilities.matrix.supports(.liveView))
+        XCTAssertTrue(capabilities.settings.isEmpty)
+
+        do {
+            _ = try await client.captureStill()
+            XCTFail("Expected unsupported capture")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .unsupported(.stillCapture))
+        }
+        do {
+            _ = try await client.setSetting(key: "iso", value: "1600")
+            XCTFail("Expected read-only setting rejection")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .invalidSetting(key: "iso", value: "1600"))
+        }
+        try await client.startLiveView()
+        let finalRequestCount = await transport.requests().count
+        XCTAssertEqual(finalRequestCount, requestCount + 1)
+    }
+
+    func testCapabilityEvidenceIsBoundedAndRemovesQueries() async throws {
+        let longSegment = String(repeating: "x", count: 600)
+        let entries = (0..<300).map { index in
+            #"{"path":"/diagnostics/item\#(index)/\#(longSegment)?token=secret","get":true}"#
+        }.joined(separator: ",")
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: "{\"ver100\":[\(entries)]}")
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let capabilities = try await client.capabilities()
+        let evidence = capabilities.evidence
+
+        XCTAssertEqual(evidence.advertisedCommands.count, 256)
+        XCTAssertTrue(evidence.truncated)
+        XCTAssertTrue(evidence.advertisedCommands.allSatisfy { !$0.contains("?") && !$0.contains("secret") })
+        XCTAssertTrue(
+            evidence.advertisedCommands.allSatisfy { $0.count <= 512 }
+        )
+    }
+
+    func testHalfPressUsesAdvertisedMethodAndAlwaysReleases() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver110":[{"path":"/shooting/control/shutterbutton/manual","put":true}]}"#
+        )
+        await transport.enqueue(method: "PUT", path: "/ccapi/ver110/shooting/control/shutterbutton/manual", status: 204, body: Data())
+        await transport.enqueue(method: "PUT", path: "/ccapi/ver110/shooting/control/shutterbutton/manual", status: 204, body: Data())
+        await enqueueStatus(on: transport, prefix: "/ccapi/ver110")
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        _ = try await client.halfPressShutter()
+
+        let requests = await transport.requests()
+        let commands = requests.filter { $0.path.contains("shutterbutton/manual") }
+        XCTAssertEqual(commands.map(\.method), ["PUT", "PUT"])
+        let actions = try commands.map { request -> String in
+            let body = try XCTUnwrap(request.body)
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+            return try XCTUnwrap(json["action"] as? String)
+        }
+        XCTAssertEqual(actions, ["half_press", "release"])
+    }
+
+    func testBulbExposureUsesManualPressAndReleaseWithoutPollingWhilePressed() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        await enqueueStatus(on: transport)
+        await transport.enqueue(
+            method: "PUT",
+            path: "/ccapi/ver100/shooting/control/shutterbutton/manual",
+            status: 204,
+            body: Data()
+        )
+        await transport.enqueue(
+            method: "PUT",
+            path: "/ccapi/ver100/shooting/control/shutterbutton/manual",
+            status: 204,
+            body: Data()
+        )
+        await enqueueStatus(on: transport)
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let started = try await client.startBulbExposure()
+        XCTAssertEqual(started.bulbExposureActive, true)
+        let startRequests = await transport.requests()
+        XCTAssertEqual(startRequests.last?.path, "/ccapi/ver100/shooting/control/shutterbutton/manual")
+
+        let stopped = try await client.stopBulbExposure()
+        XCTAssertEqual(stopped.bulbExposureActive, false)
+
+        let commands = await transport.requests().filter { $0.path.contains("shutterbutton/manual") }
+        XCTAssertEqual(commands.map(\.method), ["PUT", "PUT"])
+        let payloads = try commands.map { request -> [String: Any] in
+            let body = try XCTUnwrap(request.body)
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        }
+        XCTAssertEqual(payloads[0]["action"] as? String, "full_press")
+        XCTAssertEqual(payloads[0]["af"] as? Bool, false)
+        XCTAssertEqual(payloads[1]["action"] as? String, "release")
+        XCTAssertEqual(payloads[1]["af"] as? Bool, false)
+        let remainingResponses = await transport.remainingResponses()
+        XCTAssertEqual(remainingResponses, 0)
+    }
+
+    func testFailedBulbPressStillAttemptsRelease() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        await enqueueStatus(on: transport)
+        await transport.enqueueJSON(
+            method: "PUT",
+            path: "/ccapi/ver100/shooting/control/shutterbutton/manual",
+            status: 503,
+            body: #"{"message":"press response lost"}"#
+        )
+        await transport.enqueue(
+            method: "PUT",
+            path: "/ccapi/ver100/shooting/control/shutterbutton/manual",
+            status: 204,
+            body: Data()
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        do {
+            _ = try await client.startBulbExposure()
+            XCTFail("Expected Bulb press failure")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("503"))
+        }
+
+        let commands = await transport.requests().filter { $0.path.contains("shutterbutton/manual") }
+        let actions = try commands.map { request -> String in
+            let body = try XCTUnwrap(request.body)
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+            return try XCTUnwrap(json["action"] as? String)
+        }
+        XCTAssertEqual(actions, ["full_press", "release"])
+        let remainingResponses = await transport.remainingResponses()
+        XCTAssertEqual(remainingResponses, 0)
+    }
+
+    func testAutofocusUsesAdvertisedCanonStartAndStopActions() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver110":[{"path":"/shooting/control/af","post":true}]}"#
+        )
+        await transport.enqueue(method: "POST", path: "/ccapi/ver110/shooting/control/af", status: 204, body: Data())
+        await transport.enqueue(method: "POST", path: "/ccapi/ver110/shooting/control/af", status: 204, body: Data())
+        await enqueueStatus(on: transport, prefix: "/ccapi/ver110")
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        _ = try await client.autofocus()
+
+        let commands = await transport.requests().filter { $0.path.contains("/shooting/control/af") }
+        XCTAssertEqual(commands.map(\.method), ["POST", "POST"])
+        let actions = try commands.map { request -> String in
+            let body = try XCTUnwrap(request.body)
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+            return try XCTUnwrap(json["action"] as? String)
+        }
+        XCTAssertEqual(actions, ["start", "stop"])
+    }
+
+    func testFailedAutofocusStartStillSendsStop() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver110":[{"path":"/shooting/control/af","post":true}]}"#
+        )
+        await transport.enqueueJSON(
+            method: "POST",
+            path: "/ccapi/ver110/shooting/control/af",
+            status: 503,
+            body: #"{"message":"focus failed"}"#
+        )
+        await transport.enqueue(method: "POST", path: "/ccapi/ver110/shooting/control/af", status: 204, body: Data())
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        do {
+            _ = try await client.autofocus()
+            XCTFail("Expected autofocus failure")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("503"))
+        }
+
+        let requests = await transport.requests()
+        let commands = requests.filter { $0.path.contains("/shooting/control/af") }
+        let actions = try commands.map { request -> String in
+            let body = try XCTUnwrap(request.body)
+            let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+            return try XCTUnwrap(json["action"] as? String)
+        }
+        XCTAssertEqual(actions, ["start", "stop"])
+    }
+
+    func testUnadvertisedAutofocusFailsWithoutACommand() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: #"{"ver100":[{"path":"/deviceinformation","get":true}]}"#)
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        do {
+            _ = try await client.autofocus()
+            XCTFail("Expected unsupported autofocus")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .unsupported(.autofocus))
+        }
+        let requestCount = await transport.requests().count
+        XCTAssertEqual(requestCount, 1)
+    }
+
+    func testLiveViewRetriesWithoutSizeAfter400AndFallsBackToFlipDetail() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        await transport.enqueueJSON(
+            method: "POST",
+            path: "/ccapi/ver100/shooting/liveview",
+            status: 400,
+            body: #"{"message":"Invalid parameter"}"#
+        )
+        await transport.enqueue(method: "POST", path: "/ccapi/ver100/shooting/liveview", status: 204, body: Data())
+        let jpeg = Data([0xFF, 0xD8, 0x05, 0x06, 0xFF, 0xD9])
+        await transport.enqueue(
+            method: "GET",
+            path: "/ccapi/ver100/shooting/liveview/flipdetail?kind=both",
+            headers: ["content-type": "application/octet-stream"],
+            body: detailedLiveView(jpeg: jpeg)
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        try await client.startLiveView(LiveViewRequest(fps: 15, size: .large))
+        let frame = try await client.liveViewFrame(cacheKey: 7)
+
+        XCTAssertEqual(frame.data, jpeg)
+        let requests = await transport.requests()
+        let startBodies = requests.filter { $0.path == "/ccapi/ver100/shooting/liveview" }.compactMap(\.body)
+        XCTAssertEqual(startBodies.count, 2)
+        let fallback = try XCTUnwrap(JSONSerialization.jsonObject(with: startBodies[1]) as? [String: Any])
+        XCTAssertEqual(fallback["cameradisplay"] as? String, "on")
+        XCTAssertNil(fallback["liveviewsize"])
+    }
+
+    func testLiveViewFrameRetriesTransientCanonDeviceBusy() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/shooting/liveview/flipdetail?kind=both",
+            status: 503,
+            body: #"{"message":"Device busy"}"#
+        )
+        let jpeg = Data([0xFF, 0xD8, 0x09, 0x0A, 0xFF, 0xD9])
+        await transport.enqueue(
+            path: "/ccapi/ver100/shooting/liveview/flipdetail?kind=both",
+            headers: ["content-type": "application/octet-stream"],
+            body: detailedLiveView(jpeg: jpeg)
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let frame = try await client.liveViewFrame(cacheKey: 33)
+        let requests = await transport.requests()
+
+        XCTAssertEqual(frame.data, jpeg)
+        XCTAssertEqual(
+            requests.map(\.path),
+            [
+                "/ccapi",
+                "/ccapi/ver100/shooting/liveview/flipdetail?kind=both",
+                "/ccapi/ver100/shooting/liveview/flipdetail?kind=both",
+            ]
+        )
+    }
+
+    func testInvalidLargeLiveViewStartFallsBackToMediumAndPrunesLarge() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: postOnlyLiveViewDiscovery)
+        await transport.enqueueJSON(
+            method: "POST",
+            path: "/ccapi/ver130/shooting/liveview",
+            status: 400,
+            body: #"{"message":"Invalid parameter"}"#
+        )
+        await transport.enqueueJSON(
+            method: "POST",
+            path: "/ccapi/ver130/shooting/liveview",
+            status: 400,
+            body: #"{"message":"Invalid parameter"}"#
+        )
+        await transport.enqueue(
+            method: "POST",
+            path: "/ccapi/ver130/shooting/liveview",
+            status: 204,
+            body: Data()
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        try await client.startLiveView(
+            LiveViewRequest(size: .large, source: .ccapiJPEGPolling)
+        )
+
+        let activeSize = await client.currentLiveViewSize()
+        XCTAssertEqual(activeSize, .medium)
+        let capabilities = try await client.capabilities()
+        XCTAssertEqual(capabilities.liveView.sizes, [.small, .medium])
+        XCTAssertEqual(capabilities.liveView.defaultSize, .medium)
+        let requests = await transport.requests()
+        let starts = requests.filter { $0.method == "POST" }
+        XCTAssertEqual(starts.count, 3)
+        let bodies = try starts.map { request in
+            try XCTUnwrap(
+                JSONSerialization.jsonObject(with: try XCTUnwrap(request.body)) as? [String: String]
+            )
+        }
+        XCTAssertEqual(bodies[0]["liveviewsize"], "large")
+        XCTAssertNil(bodies[1]["liveviewsize"])
+        XCTAssertEqual(bodies[2]["liveviewsize"], "medium")
+    }
+
+    func testPostOnlyJPEGLiveViewUsesCanonPostOffStopAndReportsActiveSize() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: postOnlyLiveViewDiscovery)
+        let jpeg = Data([0xFF, 0xD8, 0x11, 0x12, 0xFF, 0xD9])
+        await transport.enqueue(method: "POST", path: "/ccapi/ver130/shooting/liveview", status: 204, body: Data())
+        await transport.enqueue(
+            method: "GET",
+            path: "/ccapi/ver130/shooting/liveview/flip?t=21",
+            headers: ["content-type": "image/jpeg"],
+            body: jpeg
+        )
+        await transport.enqueue(
+            method: "POST",
+            path: "/ccapi/ver130/shooting/liveview",
+            status: 204,
+            body: Data()
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let beforeStart = try await client.capabilities()
+        XCTAssertTrue(beforeStart.matrix.supports(.liveView))
+        XCTAssertTrue(beforeStart.matrix.supports(.liveViewJPEGPolling))
+        XCTAssertEqual(beforeStart.liveView.sources, [.ccapiJPEGPolling])
+        XCTAssertNil(beforeStart.liveView.currentSize)
+
+        try await client.startLiveView(LiveViewRequest(size: .medium, source: .auto))
+        let activeSizeBeforeFrame = await client.currentLiveViewSize()
+        XCTAssertEqual(activeSizeBeforeFrame, .medium)
+        let afterStart = try await client.capabilities()
+        XCTAssertFalse(afterStart.evidence.observedFeatures.contains(.liveViewJPEGPolling))
+        let frame = try await client.liveViewFrame(cacheKey: 21)
+        XCTAssertEqual(frame.data, jpeg)
+        let activeSizeAfterFrame = await client.currentLiveViewSize()
+        XCTAssertEqual(activeSizeAfterFrame, .medium)
+        let afterFrame = try await client.capabilities()
+        XCTAssertTrue(afterFrame.evidence.observedFeatures.contains(.liveViewJPEGPolling))
+        await client.stopLiveView()
+        let stoppedSize = await client.currentLiveViewSize()
+        XCTAssertNil(stoppedSize)
+
+        let afterStop = try await client.capabilities()
+        XCTAssertNil(afterStop.liveView.currentSize)
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map { "\($0.method) \($0.path)" }, [
+            "GET /ccapi",
+            "POST /ccapi/ver130/shooting/liveview",
+            "GET /ccapi/ver130/shooting/liveview/flip?t=21",
+            "POST /ccapi/ver130/shooting/liveview",
+        ])
+        let stop = try XCTUnwrap(requests.last?.body)
+        let stopJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: stop) as? [String: String])
+        XCTAssertEqual(stopJSON, ["liveviewsize": "off", "cameradisplay": "on"])
+    }
+
+    func testJPEGModeNotSupportedDowngradesMediumToSmallAndReportsTruthfulSize() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: postOnlyLiveViewDiscovery)
+        await transport.enqueue(method: "POST", path: "/ccapi/ver130/shooting/liveview", status: 204, body: Data())
+        await transport.enqueue(
+            method: "GET",
+            path: "/ccapi/ver130/shooting/liveview/flip?t=22",
+            status: 503,
+            body: #"{"message":"Mode not supported"}"#.data(using: .utf8)!
+        )
+        await transport.enqueue(
+            method: "POST",
+            path: "/ccapi/ver130/shooting/liveview",
+            status: 204,
+            body: Data()
+        )
+        await transport.enqueue(method: "POST", path: "/ccapi/ver130/shooting/liveview", status: 204, body: Data())
+        let jpeg = Data([0xFF, 0xD8, 0x21, 0x22, 0xFF, 0xD9])
+        await transport.enqueue(
+            method: "GET",
+            path: "/ccapi/ver130/shooting/liveview/flip?t=22",
+            headers: ["content-type": "image/jpeg"],
+            body: jpeg
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        try await client.startLiveView(LiveViewRequest(size: .medium, source: .auto))
+        let frame = try await client.liveViewFrame(cacheKey: 22)
+
+        XCTAssertEqual(frame.data, jpeg)
+        let activeSize = await client.currentLiveViewSize()
+        XCTAssertEqual(activeSize, .small)
+        let capabilities = try await client.capabilities()
+        XCTAssertEqual(capabilities.liveView.currentSize, .small)
+        XCTAssertFalse(capabilities.liveView.sizes.contains(.medium))
+
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map { "\($0.method) \($0.path)" }, [
+            "GET /ccapi",
+            "POST /ccapi/ver130/shooting/liveview",
+            "GET /ccapi/ver130/shooting/liveview/flip?t=22",
+            "POST /ccapi/ver130/shooting/liveview",
+            "POST /ccapi/ver130/shooting/liveview",
+            "GET /ccapi/ver130/shooting/liveview/flip?t=22",
+        ])
+        let starts = requests.filter { $0.method == "POST" && $0.path.hasSuffix("/shooting/liveview") }
+        XCTAssertEqual(starts.count, 3)
+        let firstStart = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try XCTUnwrap(starts[0].body)) as? [String: Any]
+        )
+        let secondStart = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try XCTUnwrap(starts[1].body)) as? [String: Any]
+        )
+        XCTAssertEqual(firstStart["liveviewsize"] as? String, "medium")
+        XCTAssertEqual(secondStart["liveviewsize"] as? String, "off")
+        let thirdStart = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: try XCTUnwrap(starts[2].body)) as? [String: Any]
+        )
+        XCTAssertEqual(thirdStart["liveviewsize"] as? String, "small")
+    }
+
+    func testJPEGStillPreservesAdvertisedDeleteStopLifecycle() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver130":[{"path":"/shooting/liveview","post":true,"delete":true},{"path":"/shooting/liveview/flip","get":true}]}"#
+        )
+        await transport.enqueue(method: "POST", path: "/ccapi/ver130/shooting/liveview", status: 204, body: Data())
+        await transport.enqueue(method: "DELETE", path: "/ccapi/ver130/shooting/liveview", status: 204, body: Data())
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        try await client.startLiveView(LiveViewRequest(source: .ccapiJPEGPolling))
+        await client.stopLiveView()
+
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map { "\($0.method) \($0.path)" }, [
+            "GET /ccapi",
+            "POST /ccapi/ver130/shooting/liveview",
+            "DELETE /ccapi/ver130/shooting/liveview",
+        ])
+        XCTAssertNil(requests.last?.body)
+    }
+
+    func testTapFocusUsesCanonImagePositionCoordinates() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        let jpeg = Data([0xFF, 0xD8, 0x01, 0x02, 0xFF, 0xD9])
+        await transport.enqueue(
+            method: "GET",
+            path: "/ccapi/ver100/shooting/liveview/flipdetail?kind=both",
+            headers: ["content-type": "application/octet-stream"],
+            body: detailedLiveView(jpeg: jpeg)
+        )
+        await transport.enqueue(
+            method: "PUT",
+            path: "/ccapi/ver100/shooting/liveview/afframeposition",
+            status: 204,
+            body: Data()
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        try await client.initialize()
+        _ = try await client.liveViewFrame(cacheKey: 9)
+        let result = try await client.tapFocus(x: 0.25, y: 0.75)
+
+        XCTAssertEqual(result, FocusResult(accepted: true, x: 0.25, y: 0.75))
+        let requests = await transport.requests()
+        let focus = try XCTUnwrap(requests.first { $0.path.hasSuffix("/shooting/liveview/afframeposition") })
+        let body = try XCTUnwrap(focus.body)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Int])
+        XCTAssertEqual(json, ["positionx": 1600, "positiony": 3200])
+    }
+
+    func testClickWhiteBalanceUsesCanonImagePositionCoordinates() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        let jpeg = Data([0xFF, 0xD8, 0x01, 0x02, 0xFF, 0xD9])
+        await transport.enqueue(
+            method: "GET",
+            path: "/ccapi/ver100/shooting/liveview/flipdetail?kind=both",
+            headers: ["content-type": "application/octet-stream"],
+            body: detailedLiveView(jpeg: jpeg)
+        )
+        await transport.enqueue(
+            method: "POST",
+            path: "/ccapi/ver100/shooting/liveview/clickwb",
+            status: 204,
+            body: Data()
+        )
+        await enqueueStatus(on: transport)
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        try await client.initialize()
+        _ = try await client.liveViewFrame(cacheKey: 10)
+        let status = try await client.clickWhiteBalance(x: 0.4, y: 0.6)
+
+        XCTAssertEqual(status.exposure.whiteBalance, "auto")
+        let requests = await transport.requests()
+        let click = try XCTUnwrap(requests.first { $0.path.hasSuffix("/shooting/liveview/clickwb") })
+        let body = try XCTUnwrap(click.body)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Int])
+        XCTAssertEqual(json, ["positionx": 2500, "positiony": 2600])
+    }
+
+    func testSimulatorClickWhiteBalanceUsesTheCommandResponse() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            method: "POST",
+            path: "/ccapi/whitebalance/click",
+            body: #"{"connected":true,"battery":{"level":82,"status":"good"},"recordable_shots":2418,"remaining_recording_seconds":7200,"media":{"available":true,"remaining_minutes":120,"total_bytes":128000000000,"free_bytes":84000000000,"free_images":2418,"devices":2},"exposure":{"iso":"800","shutter":"1/50","aperture":"2.8","white_balance":"click"}}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://127.0.0.1:18080",
+            mode: .simulator,
+            transport: transport
+        )
+
+        let status = try await client.clickWhiteBalance(x: 0.4, y: 0.6)
+
+        XCTAssertEqual(status.exposure.whiteBalance, "click")
+        XCTAssertEqual(status.storageFreeImages, 2_418)
+        XCTAssertEqual(status.storageDeviceCount, 2)
+        XCTAssertEqual(status.recordableShots, 2_418)
+        XCTAssertEqual(status.remainingRecordingSeconds, 7_200)
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map(\.path), ["/ccapi/whitebalance/click"])
+        let body = try XCTUnwrap(requests.first?.body)
+        let json = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(json["x"] as? Double, 0.4)
+        XCTAssertEqual(json["y"] as? Double, 0.6)
+    }
+
+    func testTapFocusWithoutDetailedFrameSendsNoCommand() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        try await client.initialize()
+        do {
+            _ = try await client.tapFocus(x: 0.25, y: 0.75)
+            XCTFail("Expected missing Live View metadata")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("detailed Live View frame"))
+        }
+        do {
+            _ = try await client.clickWhiteBalance(x: 0.25, y: 0.75)
+            XCTFail("Expected missing Live View metadata")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("detailed Live View frame"))
+        }
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.count, 1)
+    }
+
+    func testTapFocusNeedsBothAdvertisedEndpointAndDetailedLiveView() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/liveview","post":true,"delete":true},{"path":"/shooting/liveview/afframeposition","put":true},{"path":"/shooting/liveview/clickwb","post":true}]}"#
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertFalse(capabilities.matrix.supports(.tapFocus))
+        XCTAssertTrue(capabilities.matrix.planned.contains(.tapFocus))
+        XCTAssertFalse(capabilities.matrix.supports(.clickWhiteBalance))
+        XCTAssertTrue(capabilities.matrix.planned.contains(.clickWhiteBalance))
+    }
+
+    func testSettingRejectsValueNotAdvertisedByCamera() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: settings)
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        _ = try await client.capabilities()
+        do {
+            _ = try await client.setSetting(key: "iso", value: "51200")
+            XCTFail("Expected invalid setting value")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .invalidSetting(key: "iso", value: "51200"))
+        }
+        let requestCount = await transport.requests().count
+        XCTAssertEqual(requestCount, 2)
+    }
+
+    func testSettingWritesOnlyAnAdvertisedValueToDiscoveredPath() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: settings)
+        await transport.enqueue(method: "PUT", path: "/ccapi/ver100/shooting/settings/iso", status: 204, body: Data())
+        await enqueueStatus(on: transport)
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        _ = try await client.capabilities()
+        _ = try await client.setSetting(key: "iso", value: "1600")
+
+        let requests = await transport.requests()
+        let write = try XCTUnwrap(requests.first { $0.method == "PUT" })
+        let body = try XCTUnwrap(write.body)
+        let value = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
+        XCTAssertEqual(value, ["value": "1600"])
+    }
+
+    func testCanonZoomRequiresMatchingGetPostAndWritesIntegerValue() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/devicestatus/batterylist","get":true},{"path":"/devicestatus/storage","get":true},{"path":"/shooting/settings","get":true},{"path":"/shooting/control/zoom","get":true,"post":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/shooting/control/zoom",
+            body: #"{"value":50,"ability":{"min":0,"max":100,"step":25}}"#
+        )
+        await transport.enqueueJSON(
+            method: "POST",
+            path: "/ccapi/ver100/shooting/control/zoom",
+            body: #"{"value":75}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/devicestatus/batterylist",
+            body: #"{"batterylist":[{"level":89}]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/devicestatus/storage",
+            body: #"{"storagelist":[{"name":"card1","spacesize":32000000000}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/shooting/control/zoom",
+            body: #"{"value":75,"ability":{"min":0,"max":100,"step":25}}"#
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let capabilities = try await client.capabilities()
+        XCTAssertEqual(capabilities.setting("zoom")?.values, ["0", "25", "50", "75", "100"])
+        XCTAssertEqual(capabilities.setting("zoom")?.value, "50")
+        XCTAssertTrue(capabilities.matrix.supports(.zoomControl))
+
+        _ = try await client.setSetting(key: "zoom", value: "75")
+
+        let requests = await transport.requests()
+        let write = try XCTUnwrap(requests.first {
+            $0.method == "POST" && $0.path == "/ccapi/ver100/shooting/control/zoom"
+        })
+        let body = try XCTUnwrap(write.body)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(object["value"] as? Int, 75)
+    }
+
+    func testCanonZoomIsHiddenWithoutMatchingPost() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/shooting/control/zoom","get":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertNil(capabilities.setting("zoom"))
+        XCTAssertFalse(capabilities.matrix.supports(.zoomControl))
+        XCTAssertTrue(capabilities.matrix.planned.contains(.zoomControl))
+        let requestCount = await transport.requests().count
+        XCTAssertEqual(requestCount, 2)
+    }
+
+    func testCanonSoundRecordingLevelRequiresMatchingGetPutAndWritesIntegerValue() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/devicestatus/batterylist","get":true},{"path":"/devicestatus/storage","get":true},{"path":"/shooting/settings","get":true},{"path":"/shooting/settings/soundrecording/level","get":true,"put":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/shooting/settings/soundrecording/level",
+            body: #"{"value":32,"ability":{"min":0,"max":63,"step":1}}"#
+        )
+        for _ in 0..<2 {
+            await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+            await transport.enqueueJSON(
+                path: "/ccapi/ver100/shooting/settings/soundrecording/level",
+                body: #"{"value":32,"ability":{"min":0,"max":63,"step":1}}"#
+            )
+        }
+        await transport.enqueueJSON(
+            method: "PUT",
+            path: "/ccapi/ver100/shooting/settings/soundrecording/level",
+            body: #"{"value":48}"#
+        )
+        await enqueueStatus(on: transport)
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/shooting/settings/soundrecording/level",
+            body: #"{"value":48,"ability":{"min":0,"max":63,"step":1}}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+        XCTAssertEqual(capabilities.setting("soundrecordinglevel")?.value, "32")
+        XCTAssertEqual(capabilities.setting("soundrecordinglevel")?.values, (0...63).map(String.init))
+        XCTAssertTrue(capabilities.matrix.supports(.soundRecordingLevelControl))
+        XCTAssertTrue(capabilities.evidence.writableSettings.contains("soundrecordinglevel"))
+        let requestCount = await transport.requests().count
+        do {
+            _ = try await client.setSetting(key: "soundrecordinglevel", value: "64")
+            XCTFail("Expected an unadvertised sound-recording level to be rejected")
+        } catch {
+            XCTAssertEqual(
+                error as? CCAPIError,
+                .invalidSetting(key: "soundrecordinglevel", value: "64")
+            )
+        }
+        let requestsAfterRejection = await transport.requests()
+        XCTAssertEqual(requestsAfterRejection.count, requestCount + 2)
+        XCTAssertFalse(requestsAfterRejection.contains(where: { $0.method == "PUT" }))
+
+        _ = try await client.setSetting(key: "soundrecordinglevel", value: "48")
+
+        let requests = await transport.requests()
+        let write = try XCTUnwrap(requests.first {
+            $0.method == "PUT" && $0.path == "/ccapi/ver100/shooting/settings/soundrecording/level"
+        })
+        let body = try XCTUnwrap(write.body)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(object["value"] as? Int, 48)
+    }
+
+    func testCanonSoundRecordingLevelRejectsMalformedRanges() async throws {
+        let responses = [
+            #"{"value":false,"ability":{"min":0,"max":63,"step":1}}"#,
+            #"{"value":32.0,"ability":{"min":0,"max":63,"step":1}}"#,
+            #"{"value":32,"ability":{"min":0,"max":1000,"step":1}}"#,
+            #"{"value":32,"ability":{"min":0,"max":63,"step":0}}"#,
+            #"{"value":33,"ability":{"min":0,"max":63,"step":2}}"#,
+            #"{"value":32,"ability":{"min":32,"max":32,"step":1}}"#,
+        ]
+
+        for response in responses {
+            let transport = MockCameraHTTPTransport()
+            await transport.enqueueJSON(
+                path: "/ccapi",
+                body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/shooting/settings/soundrecording/level","get":true,"put":true}]}"#
+            )
+            await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+            await transport.enqueueJSON(
+                path: "/ccapi/ver100/shooting/settings/soundrecording/level",
+                body: response
+            )
+            let client = try CCAPIClient(
+                baseURL: "http://192.168.1.2:8080",
+                mode: .camera,
+                transport: transport
+            )
+
+            let capabilities = try await client.capabilities()
+
+            XCTAssertNil(capabilities.setting("soundrecordinglevel"))
+            XCTAssertFalse(capabilities.matrix.supports(.soundRecordingLevelControl))
+            XCTAssertTrue(capabilities.matrix.planned.contains(.soundRecordingLevelControl))
+        }
+    }
+
+    func testCanonSoundRecordingLevelDoesNotCombineGetPutAcrossVersions() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/shooting/settings/soundrecording/level","get":true}],"ver110":[{"path":"/shooting/settings/soundrecording/level","put":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertNil(capabilities.setting("soundrecordinglevel"))
+        XCTAssertFalse(capabilities.matrix.supports(.soundRecordingLevelControl))
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertFalse(requests.contains(where: { $0.path.contains("soundrecording/level") }))
+    }
+
+    func testCanonSoundRecordingControlsRequireMatchingPairAndRefreshBeforeStringWrite() async throws {
+        let transport = MockCameraHTTPTransport()
+        let path = "/ccapi/ver100/shooting/settings/soundrecording/windfilter"
+        let advertised = #"{"value":"auto","ability":["auto","enable","disable"]}"#
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/devicestatus/batterylist","get":true},{"path":"/devicestatus/storage","get":true},{"path":"/shooting/settings","get":true},{"path":"/shooting/settings/soundrecording/windfilter","get":true,"put":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await transport.enqueueJSON(path: path, body: advertised)
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await transport.enqueueJSON(path: path, body: #"{"value":"auto","ability":["auto","disable"]}"#)
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await transport.enqueueJSON(path: path, body: advertised)
+        await transport.enqueueJSON(method: "PUT", path: path, body: #"{"value":"enable"}"#)
+        await enqueueStatus(on: transport)
+        await transport.enqueueJSON(path: path, body: #"{"value":"enable","ability":["auto","enable","disable"]}"#)
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+        XCTAssertEqual(capabilities.setting("windfilter")?.values, ["auto", "enable", "disable"])
+        XCTAssertTrue(capabilities.matrix.supports(.soundRecordingControl))
+        XCTAssertTrue(capabilities.evidence.writableSettings.contains("windfilter"))
+
+        do {
+            _ = try await client.setSetting(key: "windfilter", value: "enable")
+            XCTFail("Expected a stale wind-filter option to be rejected")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .invalidSetting(key: "windfilter", value: "enable"))
+        }
+
+        _ = try await client.setSetting(key: "windfilter", value: "enable")
+
+        let requests = await transport.requests()
+        let write = try XCTUnwrap(requests.first { $0.method == "PUT" && $0.path == path })
+        let body = try XCTUnwrap(write.body)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(object["value"] as? String, "enable")
+    }
+
+    func testCanonCurrentSourceAudioControlsExposeR6MarkIIIAbilities() async throws {
+        let transport = MockCameraHTTPTransport()
+        let overallPath = "/ccapi/ver110/shooting/settings/soundrecording"
+        let modePath = "/ccapi/ver100/shooting/settings/soundrecording/mode/intmic"
+        let levelPath = "/ccapi/ver100/shooting/settings/soundrecording/level/intmic"
+        let windPath = "/ccapi/ver100/shooting/settings/soundrecording/windfilter/intmic"
+        let overall = #"{"value":"enable","ability":["enable","disable"]}"#
+        let mode = #"{"value":"auto","ability":["auto","manual"]}"#
+        let level = #"{"value":32,"ability":{"min":0,"max":63,"step":1}}"#
+        let wind = #"{"value":"enable","ability":["enable","disable"]}"#
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/devicestatus/batterylist","get":true},{"path":"/devicestatus/storage","get":true},{"path":"/shooting/settings","get":true},{"path":"/shooting/settings/soundrecording/mode/intmic","get":true,"put":true},{"path":"/shooting/settings/soundrecording/level/intmic","get":true,"put":true},{"path":"/shooting/settings/soundrecording/windfilter/intmic","get":true,"put":true}],"ver110":[{"path":"/shooting/settings/soundrecording","get":true,"put":true}]}"#
+        )
+        for _ in 0..<2 {
+            await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+            for (path, body) in [
+                (overallPath, overall), (modePath, mode), (windPath, wind), (levelPath, level),
+            ] {
+                await transport.enqueueJSON(path: path, body: body)
+            }
+        }
+        await transport.enqueueJSON(method: "PUT", path: modePath, body: #"{"value":"manual"}"#)
+        await enqueueStatus(on: transport)
+        for (path, body) in [
+            (overallPath, overall),
+            (modePath, #"{"value":"manual","ability":["auto","manual"]}"#),
+            (windPath, wind),
+            (levelPath, level),
+        ] {
+            await transport.enqueueJSON(path: path, body: body)
+        }
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertEqual(capabilities.setting("soundrecording")?.values, ["enable", "disable"])
+        XCTAssertEqual(capabilities.setting("soundrecordingmodeintmic")?.values, ["auto", "manual"])
+        XCTAssertEqual(capabilities.setting("windfilterintmic")?.values, ["enable", "disable"])
+        XCTAssertEqual(capabilities.setting("soundrecordinglevelintmic")?.values, (0...63).map(String.init))
+        XCTAssertTrue(capabilities.matrix.supports(.soundRecordingControl))
+        XCTAssertTrue(capabilities.matrix.supports(.soundRecordingLevelControl))
+
+        _ = try await client.setSetting(key: "soundrecordingmodeintmic", value: "manual")
+
+        let requests = await transport.requests()
+        let write = try XCTUnwrap(requests.first { $0.method == "PUT" && $0.path == modePath })
+        let body = try XCTUnwrap(write.body)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
+        XCTAssertEqual(object["value"], "manual")
+    }
+
+    func testCanonSoundRecordingControlsRejectMalformedStringAbilities() async throws {
+        let responses = [
+            #"{"value":"on","ability":["enable","disable"]}"#,
+            #"{"value":"auto","ability":["auto","auto"]}"#,
+            #"{"value":"auto","ability":["auto"]}"#,
+            #"{"value":"auto","ability":["auto",1]}"#,
+            #"{"value":1,"ability":["auto","disable"]}"#,
+        ]
+
+        for response in responses {
+            let transport = MockCameraHTTPTransport()
+            await transport.enqueueJSON(
+                path: "/ccapi",
+                body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/shooting/settings/soundrecording/attenuator","get":true,"put":true}]}"#
+            )
+            await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+            await transport.enqueueJSON(
+                path: "/ccapi/ver100/shooting/settings/soundrecording/attenuator",
+                body: response
+            )
+            let client = try CCAPIClient(
+                baseURL: "http://192.168.1.2:8080",
+                mode: .camera,
+                transport: transport
+            )
+
+            let capabilities = try await client.capabilities()
+
+            XCTAssertNil(capabilities.setting("attenuator"))
+            XCTAssertFalse(capabilities.matrix.supports(.soundRecordingControl))
+            XCTAssertTrue(capabilities.matrix.planned.contains(.soundRecordingControl))
+        }
+    }
+
+    func testCanonSoundRecordingControlsDoNotCombineGetPutAcrossVersions() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/shooting/settings/soundrecording","get":true}],"ver110":[{"path":"/shooting/settings/soundrecording","put":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertNil(capabilities.setting("soundrecording"))
+        XCTAssertFalse(capabilities.matrix.supports(.soundRecordingControl))
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertFalse(requests.contains(where: { $0.path.hasSuffix("/soundrecording") }))
+    }
+
+    func testCanonSoundRecordingControlsDoNotTreatAggregateSettingsAsEndpointGet() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/shooting/settings/soundrecording/windfilter","put":true}]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/shooting/settings",
+            body: #"{"windfilter":{"value":"auto","ability":["auto","enable","disable"]}}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertNil(capabilities.setting("windfilter"))
+        XCTAssertFalse(capabilities.matrix.supports(.soundRecordingControl))
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.count, 2)
+    }
+
+    func testCanonFocusBracketingRequiresExactPairsAndWritesIntegerAfterRefresh() async throws {
+        let transport = MockCameraHTTPTransport()
+        let rootPath = "/ccapi/ver100/shooting/settings/focusbracketing"
+        let smoothingPath = "\(rootPath)/exposuresmoothing"
+        let shotsPath = "\(rootPath)/numberofshots"
+        let incrementPath = "\(rootPath)/focusincrement"
+        let root = #"{"value":"disable","ability":["enable","disable"]}"#
+        let smoothing = #"{"value":"disable","ability":["enable","disable"]}"#
+        let shots = #"{"value":100,"ability":{"min":2,"max":999,"step":1}}"#
+        let increment = #"{"value":4,"ability":{"min":1,"max":10,"step":1}}"#
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/devicestatus/batterylist","get":true},{"path":"/devicestatus/storage","get":true},{"path":"/shooting/settings","get":true},{"path":"/shooting/settings/focusbracketing","get":true,"put":true},{"path":"/shooting/settings/focusbracketing/numberofshots","get":true,"put":true},{"path":"/shooting/settings/focusbracketing/focusincrement","get":true,"put":true},{"path":"/shooting/settings/focusbracketing/exposuresmoothing","get":true,"put":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        for (path, body) in [(rootPath, root), (smoothingPath, smoothing), (shotsPath, shots), (incrementPath, increment)] {
+            await transport.enqueueJSON(path: path, body: body)
+        }
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        for (path, body) in [(rootPath, root), (smoothingPath, smoothing), (shotsPath, shots), (incrementPath, increment)] {
+            await transport.enqueueJSON(path: path, body: body)
+        }
+        await transport.enqueueJSON(method: "PUT", path: shotsPath, body: #"{"value":250}"#)
+        await enqueueStatus(on: transport)
+        for (path, body) in [
+            (rootPath, root),
+            (smoothingPath, smoothing),
+            (shotsPath, #"{"value":250,"ability":{"min":2,"max":999,"step":1}}"#),
+            (incrementPath, increment),
+        ] {
+            await transport.enqueueJSON(path: path, body: body)
+        }
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertTrue(capabilities.matrix.supports(.focusBracketingControl))
+        XCTAssertEqual(capabilities.setting("focusbracketing")?.values, ["enable", "disable"])
+        XCTAssertEqual(capabilities.setting("focusbracketingnumberofshots")?.values, (2...999).map(String.init))
+        XCTAssertEqual(capabilities.setting("focusbracketingfocusincrement")?.values, (1...10).map(String.init))
+        XCTAssertTrue(capabilities.evidence.writableSettings.contains("focusbracketing"))
+
+        _ = try await client.setSetting(key: "focusbracketingnumberofshots", value: "250")
+
+        let requests = await transport.requests()
+        let write = try XCTUnwrap(requests.first { $0.method == "PUT" && $0.path == shotsPath })
+        let body = try XCTUnwrap(write.body)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(object["value"] as? Int, 250)
+        XCTAssertGreaterThanOrEqual(requests.filter { $0.path == shotsPath }.count, 3)
+    }
+
+    func testCanonFocusBracketingMalformedRootHidesGroupWithoutChildReads() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/shooting/settings/focusbracketing","get":true,"put":true},{"path":"/shooting/settings/focusbracketing/numberofshots","get":true,"put":true},{"path":"/shooting/settings/focusbracketing/focusincrement","get":true,"put":true},{"path":"/shooting/settings/focusbracketing/exposuresmoothing","get":true,"put":true}]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/shooting/settings",
+            body: #"{"focusbracketing":{"value":"disable","ability":["enable","disable"]}}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/shooting/settings/focusbracketing",
+            body: #"{"value":"disable","ability":["disable","disable"]}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertFalse(capabilities.matrix.supports(.focusBracketingControl))
+        XCTAssertTrue(capabilities.matrix.planned.contains(.focusBracketingControl))
+        XCTAssertFalse(capabilities.settings.contains { $0.key.hasPrefix("focusbracketing") })
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.filter { $0.path.contains("/focusbracketing") }.count, 1)
+    }
+
+    func testCanonFocusBracketingDoesNotCombineGetPutAcrossVersions() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/shooting/settings/focusbracketing","get":true}],"ver110":[{"path":"/shooting/settings/focusbracketing","put":true}]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/shooting/settings",
+            body: #"{"focusbracketing":{"value":"disable","ability":["enable","disable"]}}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertFalse(capabilities.matrix.supports(.focusBracketingControl))
+        XCTAssertNil(capabilities.setting("focusbracketing"))
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.count, 2)
+    }
+
+    func testCanonDeviceFunctionSettingsRequirePairsRefreshAndWriteAdvertisedValue() async throws {
+        let transport = MockCameraHTTPTransport()
+        let beepPath = "/ccapi/ver100/functions/beep"
+        let displayPath = "/ccapi/ver100/functions/displayoff"
+        let beep = #"{"value":"enable","ability":["enable","disable","disabletouch"]}"#
+        let display = #"{"value":"60","ability":["10","20","30","60","120","180"]}"#
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/devicestatus/batterylist","get":true},{"path":"/devicestatus/storage","get":true},{"path":"/shooting/settings","get":true},{"path":"/functions/beep","get":true,"put":true},{"path":"/functions/displayoff","get":true,"put":true}]}"#
+        )
+        for _ in 0..<2 {
+            await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+            await transport.enqueueJSON(path: beepPath, body: beep)
+            await transport.enqueueJSON(path: displayPath, body: display)
+        }
+        await transport.enqueueJSON(method: "PUT", path: beepPath, body: #"{"value":"disabletouch"}"#)
+        await enqueueStatus(on: transport)
+        await transport.enqueueJSON(
+            path: beepPath,
+            body: #"{"value":"disabletouch","ability":["enable","disable","disabletouch"]}"#
+        )
+        await transport.enqueueJSON(path: displayPath, body: display)
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertEqual(capabilities.setting("beep")?.values, ["enable", "disable", "disabletouch"])
+        XCTAssertEqual(capabilities.setting("displayoff")?.value, "60")
+        XCTAssertTrue(capabilities.evidence.writableSettings.contains("beep"))
+        XCTAssertTrue(capabilities.evidence.writableSettings.contains("displayoff"))
+
+        _ = try await client.setSetting(key: "beep", value: "disabletouch")
+
+        let requests = await transport.requests()
+        let write = try XCTUnwrap(requests.first { $0.method == "PUT" && $0.path == beepPath })
+        let body = try XCTUnwrap(write.body)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
+        XCTAssertEqual(object, ["value": "disabletouch"])
+        XCTAssertGreaterThanOrEqual(requests.filter { $0.path == beepPath }.count, 4)
+    }
+
+    func testCanonDeviceFunctionSettingsRejectMalformedAndCrossVersionContracts() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/functions/beep","get":true},{"path":"/functions/displayoff","get":true,"put":true}],"ver110":[{"path":"/functions/beep","put":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/functions/displayoff",
+            body: #"{"value":"60","ability":["60","future"]}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertNil(capabilities.setting("beep"))
+        XCTAssertNil(capabilities.setting("displayoff"))
+        let requests = await transport.requests()
+        XCTAssertFalse(requests.contains { $0.path.hasSuffix("/functions/beep") })
+        XCTAssertEqual(requests.count, 3)
+    }
+
+    func testSimulatorDeviceFunctionSettingsUseBackedEndpoint() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi/capabilities",
+            body: #"{"iso":["800"],"shutter":["1/50"],"aperture":["2.8"],"white_balance":["auto"],"beep":{"value":"enable","ability":["enable","disable","disabletouch"]},"displayoff":{"value":"60","ability":["10","20","30","60","120","180"]}}"#
+        )
+        await transport.enqueue(method: "PUT", path: "/ccapi/device-settings/beep", status: 204, body: Data())
+        await transport.enqueueJSON(
+            path: "/ccapi/status",
+            body: #"{"connected":true,"battery":{"level":82,"status":"good"},"media":{"available":true,"remaining_minutes":120},"exposure":{"iso":"800","shutter":"1/50","aperture":"2.8","white_balance":"auto"}}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://127.0.0.1:18080",
+            mode: .simulator,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+        _ = try await client.setSetting(key: "beep", value: "disabletouch")
+
+        XCTAssertEqual(capabilities.setting("beep")?.value, "enable")
+        XCTAssertEqual(capabilities.setting("displayoff")?.value, "60")
+        let requests = await transport.requests()
+        let request = try XCTUnwrap(requests.first { $0.path == "/ccapi/device-settings/beep" })
+        let body = try XCTUnwrap(request.body)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
+        XCTAssertEqual(object, ["value": "disabletouch"])
+    }
+
+    func testSimulatorSourceAudioControlsUseBackedEndpoints() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi/capabilities",
+            body: #"{"iso":["800"],"shutter":["1/50"],"aperture":["2.8"],"white_balance":["auto"],"soundrecordingmodeintmic":{"value":"manual","ability":["auto","manual"]},"soundrecordinglevelintmic":{"value":32,"ability":{"min":0,"max":63,"step":1}},"windfilterintmic":{"value":"enable","ability":["enable","disable"]}}"#
+        )
+        await transport.enqueue(
+            method: "PUT",
+            path: "/ccapi/sound-recording-mode/internal-mic",
+            status: 204,
+            body: Data()
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/status",
+            body: #"{"connected":true,"battery":{"level":82,"status":"good"},"media":{"available":true},"exposure":{"iso":"800","shutter":"1/50","aperture":"2.8","white_balance":"auto"}}"#
+        )
+        await transport.enqueue(
+            method: "PUT",
+            path: "/ccapi/sound-recording-level/internal-mic",
+            status: 204,
+            body: Data()
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/status",
+            body: #"{"connected":true,"battery":{"level":82,"status":"good"},"media":{"available":true},"exposure":{"iso":"800","shutter":"1/50","aperture":"2.8","white_balance":"auto"}}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://127.0.0.1:18080",
+            mode: .simulator,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+        _ = try await client.setSetting(key: "soundrecordingmodeintmic", value: "auto")
+        _ = try await client.setSetting(key: "soundrecordinglevelintmic", value: "41")
+
+        XCTAssertEqual(capabilities.setting("soundrecordingmodeintmic")?.values, ["auto", "manual"])
+        XCTAssertEqual(capabilities.setting("soundrecordinglevelintmic")?.values, (0...63).map(String.init))
+        XCTAssertEqual(capabilities.setting("windfilterintmic")?.values, ["enable", "disable"])
+        let requests = await transport.requests()
+        XCTAssertTrue(requests.contains { $0.path == "/ccapi/sound-recording-mode/internal-mic" })
+        let levelWrite = try XCTUnwrap(
+            requests.first { $0.path == "/ccapi/sound-recording-level/internal-mic" }
+        )
+        let body = try XCTUnwrap(levelWrite.body)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(object["value"] as? Int, 41)
+    }
+
+    func testSimulatorAutoPowerOffSeparatesTimedSettingAndSleepAction() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi/capabilities",
+            body: #"{"iso":["800"],"shutter":["1/50"],"aperture":["2.8"],"white_balance":["auto"],"autopoweroff":{"value":"180","ability":["30","60","120","180","300","600","disable","immediately"]}}"#
+        )
+        await transport.enqueue(method: "POST", path: "/ccapi/camera-sleep", status: 204, body: Data())
+        let client = try CCAPIClient(
+            baseURL: "http://127.0.0.1:18080",
+            mode: .simulator,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+        try await client.sleepCamera()
+
+        XCTAssertEqual(
+            capabilities.setting("autopoweroff")?.values,
+            ["30", "60", "120", "180", "300", "600", "disable"]
+        )
+        XCTAssertFalse(capabilities.setting("autopoweroff")?.values.contains("immediately") == true)
+        XCTAssertTrue(capabilities.matrix.supports(.cameraSleep))
+        let requests = await transport.requests()
+        XCTAssertTrue(requests.contains { $0.method == "POST" && $0.path == "/ccapi/camera-sleep" })
+    }
+
+    func testCanonAutoPowerOffUsesFreshAbilityAndSeparateImmediateAction() async throws {
+        let transport = MockCameraHTTPTransport()
+        let path = "/ccapi/ver100/functions/autopoweroff"
+        let response = #"{"value":"180","ability":["30","60","120","180","300","600","disable","immediately"]}"#
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/functions/autopoweroff","get":true,"put":true}]}"#
+        )
+        for _ in 0..<2 {
+            await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+            await transport.enqueueJSON(path: path, body: response)
+        }
+        await transport.enqueue(method: "PUT", path: path, status: 202, body: Data("{}".utf8))
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+        try await client.sleepCamera()
+
+        XCTAssertEqual(
+            capabilities.setting("autopoweroff")?.values,
+            ["30", "60", "120", "180", "300", "600", "disable"]
+        )
+        XCTAssertTrue(capabilities.matrix.supports(.cameraSleep))
+        let requests = await transport.requests()
+        let write = try XCTUnwrap(requests.first { $0.method == "PUT" && $0.path == path })
+        let body = try XCTUnwrap(write.body)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
+        XCTAssertEqual(object, ["value": "immediately"])
+        XCTAssertGreaterThanOrEqual(requests.filter { $0.path == path }.count, 3)
+    }
+
+    func testCanonCameraSleepRequiresAcceptedStatus() async throws {
+        let transport = MockCameraHTTPTransport()
+        let path = "/ccapi/ver100/functions/autopoweroff"
+        let response = #"{"value":"180","ability":["30","60","120","180","300","600","disable","immediately"]}"#
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/functions/autopoweroff","get":true,"put":true}]}"#
+        )
+        for _ in 0..<2 {
+            await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+            await transport.enqueueJSON(path: path, body: response)
+        }
+        await transport.enqueue(method: "PUT", path: path, status: 200, body: Data("{}".utf8))
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        _ = try await client.capabilities()
+        do {
+            try await client.sleepCamera()
+            XCTFail("Expected camera sleep to require Canon's HTTP 202 acceptance")
+        } catch let error as CCAPIError {
+            guard case let .invalidResponse(message) = error else {
+                return XCTFail("Unexpected camera sleep error: \(error)")
+            }
+            XCTAssertTrue(message.contains("expected HTTP 202"))
+        }
+    }
+
+    func testCanonAutoPowerOffWithoutImmediateAbilityHidesSleepOnly() async throws {
+        let transport = MockCameraHTTPTransport()
+        let path = "/ccapi/ver100/functions/autopoweroff"
+        let response = #"{"value":"180","ability":["30","60","180","disable"]}"#
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/functions/autopoweroff","get":true,"put":true}]}"#
+        )
+        for _ in 0..<2 {
+            await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+            await transport.enqueueJSON(path: path, body: response)
+        }
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertNotNil(capabilities.setting("autopoweroff"))
+        XCTAssertFalse(capabilities.matrix.supports(.cameraSleep))
+        XCTAssertTrue(capabilities.matrix.planned.contains(.cameraSleep))
+        do {
+            try await client.sleepCamera()
+            XCTFail("Expected camera sleep to require immediately in the live ability")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .unsupported(.cameraSleep))
+        }
+        let remainingResponses = await transport.remainingResponses()
+        XCTAssertEqual(remainingResponses, 0)
+    }
+
+    func testCanonMovieSettingsRequireExactPairsAndWriteStringAfterRefresh() async throws {
+        let transport = MockCameraHTTPTransport()
+        let qualityPath = "/ccapi/ver100/shooting/settings/moviequality"
+        let highFrameRatePath = "/ccapi/ver110/shooting/settings/highframerate"
+        let croppingPath = "/ccapi/ver110/shooting/settings/moviecropping"
+        let formatPath = "/ccapi/ver110/shooting/settings/movieformat"
+        let quality = #"{"value":"3840x2160_5994_ipb_standard","ability":["3840x2160_5994_ipb_standard","1920x1080_2997_ipb_standard"]}"#
+        let toggle = #"{"value":"disable","ability":["enable","disable"]}"#
+        let format = #"{"value":"xfavcs-ycc420-8bit","ability":["raw","xfhevcs-ycc422-10bit","xfhevcs-ycc420-10bit","xfavcs-ycc422-10bit","xfavcs-ycc420-8bit"]}"#
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/devicestatus/batterylist","get":true},{"path":"/devicestatus/storage","get":true},{"path":"/shooting/settings","get":true},{"path":"/shooting/settings/moviequality","get":true,"put":true}],"ver110":[{"path":"/shooting/settings/highframerate","get":true,"put":true},{"path":"/shooting/settings/moviecropping","get":true,"put":true},{"path":"/shooting/settings/movieformat","get":true,"put":true}]}"#
+        )
+        for _ in 0..<2 {
+            await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+            for (path, body) in [
+                (qualityPath, quality),
+                (highFrameRatePath, toggle),
+                (croppingPath, toggle),
+                (formatPath, format),
+            ] {
+                await transport.enqueueJSON(path: path, body: body)
+            }
+        }
+        await transport.enqueueJSON(
+            method: "PUT",
+            path: formatPath,
+            body: #"{"value":"xfhevcs-ycc422-10bit"}"#
+        )
+        await enqueueStatus(on: transport)
+        for (path, body) in [
+            (qualityPath, quality),
+            (highFrameRatePath, toggle),
+            (croppingPath, toggle),
+            (
+                formatPath,
+                #"{"value":"xfhevcs-ycc422-10bit","ability":["raw","xfhevcs-ycc422-10bit","xfhevcs-ycc420-10bit","xfavcs-ycc422-10bit","xfavcs-ycc420-8bit"]}"#
+            ),
+        ] {
+            await transport.enqueueJSON(path: path, body: body)
+        }
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertTrue(capabilities.matrix.supports(.movieSettingsControl))
+        XCTAssertEqual(
+            capabilities.setting("moviequality")?.values,
+            ["3840x2160_5994_ipb_standard", "1920x1080_2997_ipb_standard"]
+        )
+        XCTAssertEqual(capabilities.setting("highframerate")?.values, ["enable", "disable"])
+        XCTAssertEqual(capabilities.setting("moviecropping")?.value, "disable")
+        XCTAssertEqual(
+            capabilities.setting("movieformat")?.values,
+            [
+                "raw", "xfhevcs-ycc422-10bit", "xfhevcs-ycc420-10bit",
+                "xfavcs-ycc422-10bit", "xfavcs-ycc420-8bit",
+            ]
+        )
+        XCTAssertTrue(
+            Set(["moviequality", "highframerate", "moviecropping", "movieformat"])
+                .isSubset(of: Set(capabilities.evidence.writableSettings))
+        )
+
+        _ = try await client.setSetting(key: "movieformat", value: "xfhevcs-ycc422-10bit")
+
+        let requests = await transport.requests()
+        let write = try XCTUnwrap(requests.first { $0.method == "PUT" && $0.path == formatPath })
+        let body = try XCTUnwrap(write.body)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(object["value"] as? String, "xfhevcs-ycc422-10bit")
+        XCTAssertGreaterThanOrEqual(requests.filter { $0.path == formatPath }.count, 3)
+    }
+
+    func testCanonMovieSettingsDoNotCombineVersionsOrTrustAggregateOnly() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/shooting/settings/moviequality","get":true}],"ver110":[{"path":"/shooting/settings/moviequality","put":true}]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/shooting/settings",
+            body: #"{"moviequality":{"value":"3840x2160_5994_ipb_standard","ability":["3840x2160_5994_ipb_standard","1920x1080_2997_ipb_standard"]}}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertFalse(capabilities.matrix.supports(.movieSettingsControl))
+        XCTAssertTrue(capabilities.matrix.planned.contains(.movieSettingsControl))
+        XCTAssertNil(capabilities.setting("moviequality"))
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.count, 2)
+    }
+
+    func testCanonMovieModeRequiresMatchingGetPostAndWritesAction() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/devicestatus/batterylist","get":true},{"path":"/devicestatus/storage","get":true},{"path":"/shooting/settings","get":true},{"path":"/shooting/control/moviemode","get":true,"post":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/shooting/control/moviemode",
+            body: #"{"status":"off"}"#
+        )
+        await transport.enqueue(
+            method: "POST",
+            path: "/ccapi/ver100/shooting/control/moviemode",
+            status: 204,
+            body: Data()
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/devicestatus/batterylist",
+            body: #"{"batterylist":[{"level":89}]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/devicestatus/storage",
+            body: #"{"storagelist":[{"name":"card1","spacesize":32000000000}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/shooting/control/moviemode",
+            body: #"{"status":"on"}"#
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let capabilities = try await client.capabilities()
+        XCTAssertEqual(capabilities.setting("moviemode")?.values, ["off", "on"])
+        XCTAssertEqual(capabilities.setting("moviemode")?.value, "off")
+        XCTAssertTrue(capabilities.matrix.supports(.movieModeControl))
+
+        _ = try await client.setSetting(key: "moviemode", value: "on")
+
+        let requests = await transport.requests()
+        let write = try XCTUnwrap(requests.first {
+            $0.method == "POST" && $0.path == "/ccapi/ver100/shooting/control/moviemode"
+        })
+        let body = try XCTUnwrap(write.body)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        XCTAssertEqual(object["action"] as? String, "on")
+    }
+
+    func testCanonMovieModeStaysPlannedWithoutMatchingPostOrValidStatus() async throws {
+        let missingPost = MockCameraHTTPTransport()
+        await missingPost.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/shooting/control/moviemode","get":true}]}"#
+        )
+        await missingPost.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        let missingPostClient = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: missingPost
+        )
+
+        var capabilities = try await missingPostClient.capabilities()
+        XCTAssertNil(capabilities.setting("moviemode"))
+        XCTAssertFalse(capabilities.matrix.supports(.movieModeControl))
+        XCTAssertTrue(capabilities.matrix.planned.contains(.movieModeControl))
+        let requestCount = await missingPost.requests().count
+        XCTAssertEqual(requestCount, 2)
+
+        let invalidStatus = MockCameraHTTPTransport()
+        await invalidStatus.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/shooting/control/moviemode","get":true,"post":true}]}"#
+        )
+        await invalidStatus.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await invalidStatus.enqueueJSON(
+            path: "/ccapi/ver100/shooting/control/moviemode",
+            body: #"{"status":"recording"}"#
+        )
+        let invalidStatusClient = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: invalidStatus
+        )
+
+        capabilities = try await invalidStatusClient.capabilities()
+        XCTAssertNil(capabilities.setting("moviemode"))
+        XCTAssertFalse(capabilities.matrix.supports(.movieModeControl))
+    }
+
+    func testCanonLiveViewMagnificationUsesStrictSameVersionContractAndReadback() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/shooting/settings/lvzoom","get":true,"put":true},{"path":"/shooting/liveview","get":true,"post":true,"delete":true},{"path":"/shooting/liveview/flip","get":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/shooting/settings/lvzoom",
+            body: #"{"value":"5","ability":["1","5","10"]}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+        XCTAssertTrue(capabilities.matrix.supports(.liveViewMagnification))
+        XCTAssertEqual(capabilities.liveView.magnifications, [.x1, .x5, .x10])
+        XCTAssertEqual(capabilities.liveView.currentMagnification, .x5)
+        XCTAssertTrue(capabilities.evidence.writableSettings.contains("lvzoom"))
+
+        await transport.enqueue(method: "POST", path: "/ccapi/ver100/shooting/liveview", status: 204)
+        try await client.startLiveView(LiveViewRequest(source: .ccapiJPEGPolling))
+        await transport.enqueueJSON(
+            method: "PUT",
+            path: "/ccapi/ver100/shooting/settings/lvzoom",
+            body: "{}"
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/shooting/settings/lvzoom",
+            body: #"{"value":"10","ability":["1","5","10"]}"#
+        )
+
+        let result = try await client.setLiveViewMagnification(.x10)
+        XCTAssertEqual(result, LiveViewMagnificationResult(accepted: true, magnification: .x10))
+        let magnificationRequests = await transport.requests()
+        let write = try XCTUnwrap(magnificationRequests.first {
+            $0.method == "PUT" && $0.path.hasSuffix("/shooting/settings/lvzoom")
+        })
+        let body = try XCTUnwrap(write.body)
+        XCTAssertEqual(
+            try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String]),
+            ["value": "10"]
+        )
+
+        await transport.enqueueJSON(
+            method: "PUT",
+            path: "/ccapi/ver100/shooting/settings/lvzoom",
+            body: "{}"
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/shooting/settings/lvzoom",
+            body: #"{"value":"5","ability":["1","5","10"]}"#
+        )
+        do {
+            _ = try await client.setLiveViewMagnification(.x10)
+            XCTFail("Expected a mismatched Live View magnification readback to fail")
+        } catch let error as CCAPIError {
+            guard case .invalidResponse = error else {
+                XCTFail("Unexpected error: \(error)")
+                return
+            }
+        }
+    }
+
+    func testCanonLiveViewMagnificationRejectsInvalidPayloads() async throws {
+        let invalidPayloads = [
+            #"{"value":5,"ability":["1","5"]}"#,
+            #"{"value":"1","ability":["1","1"]}"#,
+            #"{"value":"5","ability":["5","10"]}"#,
+            #"{"value":"10","ability":["1","5"]}"#,
+        ]
+        for payload in invalidPayloads {
+            let transport = MockCameraHTTPTransport()
+            await transport.enqueueJSON(
+                path: "/ccapi",
+                body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/shooting/settings/lvzoom","get":true,"put":true}]}"#
+            )
+            await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+            await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings/lvzoom", body: payload)
+            let client = try CCAPIClient(
+                baseURL: "http://192.168.1.2:8080",
+                mode: .camera,
+                transport: transport
+            )
+
+            let capabilities = try await client.capabilities()
+            XCTAssertFalse(capabilities.matrix.supports(.liveViewMagnification), payload)
+            XCTAssertTrue(capabilities.liveView.magnifications.isEmpty, payload)
+            XCTAssertNil(capabilities.liveView.currentMagnification, payload)
+        }
+    }
+
+    func testCanonLiveViewMagnificationDoesNotPairDifferentVersions() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/shooting/settings/lvzoom","get":true}],"ver110":[{"path":"/shooting/settings/lvzoom","put":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertFalse(capabilities.matrix.supports(.liveViewMagnification))
+        XCTAssertTrue(capabilities.matrix.planned.contains(.liveViewMagnification))
+        let requestCount = await transport.requests().count
+        XCTAssertEqual(requestCount, 2)
+    }
+
+    func testCanonCardSelectionRequiresMatchingGetPutAndWritesOnlyAdvertisedValue() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/devicestatus/batterylist","get":true},{"path":"/devicestatus/storage","get":true},{"path":"/shooting/settings","get":true},{"path":"/functions/cardselection/stillimage","get":true,"put":true},{"path":"/functions/cardselection/movie","get":true,"put":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/functions/cardselection/stillimage",
+            body: #"{"value":"card1","ability":["none","card1","card2"]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/functions/cardselection/movie",
+            body: #"{"value":"card2","ability":["card1","card2"]}"#
+        )
+        for _ in 0..<2 {
+            await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+            await transport.enqueueJSON(
+                path: "/ccapi/ver100/functions/cardselection/stillimage",
+                body: #"{"value":"card1","ability":["none","card1","card2"]}"#
+            )
+            await transport.enqueueJSON(
+                path: "/ccapi/ver100/functions/cardselection/movie",
+                body: #"{"value":"card2","ability":["card1","card2"]}"#
+            )
+        }
+        await transport.enqueueJSON(
+            method: "PUT",
+            path: "/ccapi/ver100/functions/cardselection/stillimage",
+            body: #"{"value":"card2"}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/devicestatus/batterylist",
+            body: #"{"batterylist":[{"level":89}]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/devicestatus/storage",
+            body: #"{"storagelist":[{"name":"card1","spacesize":32000000000}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/functions/cardselection/stillimage",
+            body: #"{"value":"card2","ability":["none","card1","card2"]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/functions/cardselection/movie",
+            body: #"{"value":"card2","ability":["card1","card2"]}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertEqual(capabilities.setting("cardselectionstillimage")?.value, "card1")
+        XCTAssertEqual(
+            capabilities.setting("cardselectionstillimage")?.values,
+            ["none", "card1", "card2"]
+        )
+        XCTAssertEqual(capabilities.setting("cardselectionmovie")?.value, "card2")
+        XCTAssertTrue(capabilities.matrix.supports(.cardSelectionControl))
+        XCTAssertTrue(capabilities.evidence.writableSettings.contains("cardselectionstillimage"))
+        let requestCount = await transport.requests().count
+        do {
+            _ = try await client.setSetting(key: "cardselectionstillimage", value: "card3")
+            XCTFail("Expected an unadvertised card value to be rejected")
+        } catch {
+            XCTAssertEqual(
+                error as? CCAPIError,
+                .invalidSetting(key: "cardselectionstillimage", value: "card3")
+            )
+        }
+        let requestsAfterRejection = await transport.requests()
+        XCTAssertEqual(requestsAfterRejection.count, requestCount + 3)
+        XCTAssertFalse(requestsAfterRejection.contains(where: { $0.method == "PUT" }))
+
+        _ = try await client.setSetting(key: "cardselectionstillimage", value: "card2")
+
+        let requests = await transport.requests()
+        let write = try XCTUnwrap(requests.first {
+            $0.method == "PUT" && $0.path == "/ccapi/ver100/functions/cardselection/stillimage"
+        })
+        let body = try XCTUnwrap(write.body)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
+        XCTAssertEqual(object, ["value": "card2"])
+    }
+
+    func testCanonCardSelectionRejectsMalformedAbilityAndCrossVersionPairing() async throws {
+        let malformed = MockCameraHTTPTransport()
+        await malformed.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/functions/cardselection/stillimage","get":true,"put":true}]}"#
+        )
+        await malformed.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await malformed.enqueueJSON(
+            path: "/ccapi/ver100/functions/cardselection/stillimage",
+            body: #"{"value":"card1","ability":["card1","card1"]}"#
+        )
+        let malformedClient = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: malformed
+        )
+
+        var capabilities = try await malformedClient.capabilities()
+
+        XCTAssertNil(capabilities.setting("cardselectionstillimage"))
+        XCTAssertFalse(capabilities.matrix.supports(.cardSelectionControl))
+        XCTAssertTrue(capabilities.matrix.planned.contains(.cardSelectionControl))
+
+        let crossVersion = MockCameraHTTPTransport()
+        await crossVersion.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/functions/cardselection/stillimage","get":true}],"ver110":[{"path":"/functions/cardselection/stillimage","put":true}]}"#
+        )
+        await crossVersion.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        let crossVersionClient = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: crossVersion
+        )
+
+        capabilities = try await crossVersionClient.capabilities()
+
+        XCTAssertNil(capabilities.setting("cardselectionstillimage"))
+        XCTAssertFalse(capabilities.matrix.supports(.cardSelectionControl))
+        let crossVersionRequestCount = await crossVersion.requests().count
+        XCTAssertEqual(crossVersionRequestCount, 2)
+    }
+
+    func testCanonDirectoryControlRequiresCompleteGroupAndCreatesAdvertisedDirectory() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/functions/directory/createdirectory","post":true},{"path":"/functions/directory/directoryselection","get":true,"put":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/functions/directory/directoryselection",
+            body: #"{"value":"100EOSXX","ability":["100EOSXX"]}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertEqual(capabilities.setting("directoryselection")?.value, "100EOSXX")
+        XCTAssertEqual(capabilities.setting("directoryselection")?.values, ["100EOSXX"])
+        XCTAssertTrue(capabilities.matrix.supports(.directoryControl))
+        XCTAssertTrue(capabilities.evidence.writableSettings.contains("directoryselection"))
+        let requestCount = await transport.requests().count
+        do {
+            _ = try await client.createDirectory(name: "bad")
+            XCTFail("Expected a malformed directory name to be rejected")
+        } catch {
+            XCTAssertEqual(
+                error as? CCAPIError,
+                .invalidSetting(key: "directoryname", value: "bad")
+            )
+        }
+        let requestsAfterRejection = await transport.requests()
+        XCTAssertEqual(requestsAfterRejection.count, requestCount)
+
+        await transport.enqueueJSON(
+            method: "POST",
+            path: "/ccapi/ver100/functions/directory/createdirectory",
+            body: #"{"directoryname":"ABCDE"}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/functions/directory/directoryselection",
+            body: #"{"value":"101ABCDE","ability":["100EOSXX","101ABCDE"]}"#
+        )
+
+        let created = try await client.createDirectory(name: "ABCDE")
+        XCTAssertEqual(created, "ABCDE")
+
+        let requests = await transport.requests()
+        let create = try XCTUnwrap(requests.first {
+            $0.method == "POST" && $0.path == "/ccapi/ver100/functions/directory/createdirectory"
+        })
+        let body = try XCTUnwrap(create.body)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
+        XCTAssertEqual(object, ["directoryname": "ABCDE"])
+    }
+
+    func testCanonDirectoryControlRejectsMalformedAndCrossVersionContracts() async throws {
+        let malformed = MockCameraHTTPTransport()
+        await malformed.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/functions/directory/createdirectory","post":true},{"path":"/functions/directory/directoryselection","get":true,"put":true}]}"#
+        )
+        await malformed.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await malformed.enqueueJSON(
+            path: "/ccapi/ver100/functions/directory/directoryselection",
+            body: #"{"value":"100EOSXX","ability":["100EOSXX","100EOSXX"]}"#
+        )
+        let malformedClient = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: malformed
+        )
+
+        var capabilities = try await malformedClient.capabilities()
+
+        XCTAssertNil(capabilities.setting("directoryselection"))
+        XCTAssertFalse(capabilities.matrix.supports(.directoryControl))
+        XCTAssertTrue(capabilities.matrix.planned.contains(.directoryControl))
+
+        let crossVersion = MockCameraHTTPTransport()
+        await crossVersion.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/functions/directory/createdirectory","post":true},{"path":"/functions/directory/directoryselection","get":true}],"ver110":[{"path":"/functions/directory/directoryselection","put":true}]}"#
+        )
+        await crossVersion.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        let crossVersionClient = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: crossVersion
+        )
+
+        capabilities = try await crossVersionClient.capabilities()
+
+        XCTAssertNil(capabilities.setting("directoryselection"))
+        XCTAssertFalse(capabilities.matrix.supports(.directoryControl))
+        let crossVersionRequests = await crossVersion.requests()
+        XCTAssertEqual(crossVersionRequests.count, 2)
+    }
+
+    func testCanonFileNamingRequiresCompleteGroupAndVerifiesUpdates() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: fileNamingDiscovery)
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await enqueueFileNaming(on: transport)
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: transport
+        )
+
+        let capabilities = try await client.capabilities()
+
+        let fileNaming = try XCTUnwrap(capabilities.fileNaming)
+        XCTAssertTrue(capabilities.matrix.supports(.fileNamingControl))
+        XCTAssertEqual(fileNaming.stillFilenameModeOptions, ["preset_code", "usersetting1", "usersetting2"])
+        XCTAssertEqual(fileNaming.movieReelRange, CameraIntegerRange(minimum: 1, maximum: 9_999, step: 1))
+        XCTAssertTrue(capabilities.evidence.writableSettings.contains("movie-reel-number"))
+
+        let requestCount = await transport.requests().count
+        do {
+            _ = try await client.setFileNaming(field: .stillUserSetting1, value: "_BAD")
+            XCTFail("Expected an invalid Canon file prefix to be rejected")
+        } catch {
+            XCTAssertEqual(
+                error as? CCAPIError,
+                .invalidSetting(key: CameraFileNamingField.stillUserSetting1.rawValue, value: "_BAD")
+            )
+        }
+        let requestsAfterRejection = await transport.requests()
+        XCTAssertEqual(requestsAfterRejection.count, requestCount)
+
+        await transport.enqueueJSON(
+            method: "PUT",
+            path: "/ccapi/ver100/functions/filename/stills/usersetting1",
+            body: #"{"usersetting1":"EOS_"}"#
+        )
+        await enqueueFileNaming(on: transport, stillUserSetting1: "EOS_")
+        let updatedString = try await client.setFileNaming(field: .stillUserSetting1, value: "EOS_")
+        XCTAssertEqual(updatedString.stillUserSetting1, "EOS_")
+
+        await transport.enqueueJSON(
+            method: "PUT",
+            path: "/ccapi/ver100/functions/filename/movies/reelnum",
+            body: #"{"value":42}"#
+        )
+        await enqueueFileNaming(on: transport, stillUserSetting1: "EOS_", movieReelNumber: 42)
+        let updatedInteger = try await client.setFileNaming(field: .movieReelNumber, value: "42")
+        XCTAssertEqual(updatedInteger.movieReelNumber, 42)
+
+        let requests = await transport.requests()
+        let stringWrite = try XCTUnwrap(requests.first {
+            $0.method == "PUT" && $0.path.hasSuffix("/filename/stills/usersetting1")
+        })
+        let stringBody = try XCTUnwrap(stringWrite.body)
+        XCTAssertEqual(
+            try XCTUnwrap(JSONSerialization.jsonObject(with: stringBody) as? [String: String]),
+            ["usersetting1": "EOS_"]
+        )
+        let integerWrite = try XCTUnwrap(requests.first {
+            $0.method == "PUT" && $0.path.hasSuffix("/filename/movies/reelnum")
+        })
+        let integerBody = try XCTUnwrap(integerWrite.body)
+        XCTAssertEqual(
+            (try XCTUnwrap(JSONSerialization.jsonObject(with: integerBody) as? [String: Any]))["value"] as? Int,
+            42
+        )
+        let remainingResponses = await transport.remainingResponses()
+        XCTAssertEqual(remainingResponses, 0)
+    }
+
+    func testCanonFileNamingRejectsIncompleteMalformedAndCrossVersionContracts() async throws {
+        let incomplete = MockCameraHTTPTransport()
+        let incompleteDiscovery = fileNamingDiscovery.replacingOccurrences(
+            of: #"{"path":"/functions/filename/movies/userdefined","get":true,"put":true}"#,
+            with: #"{"path":"/functions/filename/movies/userdefined","get":true}"#
+        )
+        await incomplete.enqueueJSON(path: "/ccapi", body: incompleteDiscovery)
+        await incomplete.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        let incompleteClient = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: incomplete
+        )
+
+        var capabilities = try await incompleteClient.capabilities()
+
+        XCTAssertNil(capabilities.fileNaming)
+        XCTAssertFalse(capabilities.matrix.supports(.fileNamingControl))
+        XCTAssertTrue(capabilities.matrix.planned.contains(.fileNamingControl))
+        let incompleteRequests = await incomplete.requests()
+        XCTAssertEqual(incompleteRequests.count, 2)
+
+        let malformed = MockCameraHTTPTransport()
+        await malformed.enqueueJSON(path: "/ccapi", body: fileNamingDiscovery)
+        await malformed.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        await enqueueFileNaming(on: malformed, stillUserSetting1: "_BAD")
+        let malformedClient = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: malformed
+        )
+
+        capabilities = try await malformedClient.capabilities()
+
+        XCTAssertNil(capabilities.fileNaming)
+        XCTAssertFalse(capabilities.matrix.supports(.fileNamingControl))
+
+        let crossVersion = MockCameraHTTPTransport()
+        let crossVersionDiscovery = fileNamingDiscovery
+            .replacingOccurrences(
+                of: #"{"path":"/functions/filename/stills/filename","get":true,"put":true}"#,
+                with: #"{"path":"/functions/filename/stills/filename","get":true}"#
+            )
+            .replacingOccurrences(
+                of: "]}",
+                with: #"],"ver110":[{"path":"/functions/filename/stills/filename","put":true}]}"#
+            )
+        await crossVersion.enqueueJSON(path: "/ccapi", body: crossVersionDiscovery)
+        await crossVersion.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: "{}")
+        let crossVersionClient = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            transport: crossVersion
+        )
+
+        capabilities = try await crossVersionClient.capabilities()
+
+        XCTAssertNil(capabilities.fileNaming)
+        XCTAssertFalse(capabilities.matrix.supports(.fileNamingControl))
+        let crossVersionRequests = await crossVersion.requests()
+        XCTAssertEqual(crossVersionRequests.count, 2)
+    }
+
+    func testStillImageQualityWritesCanonObjectAndPreservesCompanionFormat() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: settings)
+        await transport.enqueue(
+            method: "PUT",
+            path: "/ccapi/ver100/shooting/settings/stillimagequality",
+            status: 204,
+            body: Data()
+        )
+        await enqueueStatus(on: transport)
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        _ = try await client.capabilities()
+        do {
+            _ = try await client.setSetting(key: "stillimagequality.jpeg", value: "none")
+            XCTFail("Expected all-disabled image quality to be rejected")
+        } catch {
+            XCTAssertEqual(
+                error as? CCAPIError,
+                .invalidSetting(key: "stillimagequality.jpeg", value: "none")
+            )
+        }
+        _ = try await client.setSetting(key: "stillimagequality.raw", value: "raw")
+
+        let requests = await transport.requests()
+        let request = try XCTUnwrap(requests.first {
+            $0.method == "PUT" && $0.path == "/ccapi/ver100/shooting/settings/stillimagequality"
+        })
+        let body = try XCTUnwrap(request.body)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let value = try XCTUnwrap(object["value"] as? [String: String])
+        XCTAssertEqual(value, ["raw": "raw", "jpeg": "large_fine"])
+    }
+
+    func testWhiteBalanceShiftWritesIntegerObjectAndPreservesCompanionAxis() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: settings)
+        await transport.enqueue(
+            method: "PUT",
+            path: "/ccapi/ver100/shooting/settings/wbshift",
+            status: 204,
+            body: Data()
+        )
+        await enqueueStatus(on: transport)
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        _ = try await client.capabilities()
+        do {
+            _ = try await client.setSetting(key: "wbshift.ba", value: "10")
+            XCTFail("Expected out-of-range WB shift to be rejected")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .invalidSetting(key: "wbshift.ba", value: "10"))
+        }
+        _ = try await client.setSetting(key: "wbshift.ba", value: "9")
+
+        let requests = await transport.requests()
+        let request = try XCTUnwrap(requests.first {
+            $0.method == "PUT" && $0.path == "/ccapi/ver100/shooting/settings/wbshift"
+        })
+        let body = try XCTUnwrap(request.body)
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let value = try XCTUnwrap(object["value"] as? [String: Int])
+        XCTAssertEqual(value, ["ba": 9, "mg": 0])
+    }
+
+    func testWhiteBalanceShiftHidesMalformedOrUnboundedRanges() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/shooting/settings/wbshift","put":true}]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/shooting/settings",
+            body: #"{"wbshift":{"value":{"ba":0,"mg":0},"ability":{"ba":{"min":-1000,"max":1000,"step":1},"mg":{"min":-9,"max":9,"step":0}}}}"#
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let capabilities = try await client.capabilities()
+
+        XCTAssertFalse(capabilities.settings.contains { $0.key.hasPrefix("wbshift.") })
+    }
+
+    func testWhiteBalanceShiftRequiresCompleteIntegerCurrentValue() async throws {
+        let malformedSettings = [
+            #"{"wbshift":{"value":{"ba":0},"ability":{"ba":{"min":-9,"max":9,"step":1},"mg":{"min":-9,"max":9,"step":1}}}}"#,
+            #"{"wbshift":{"value":{"ba":0.5,"mg":0},"ability":{"ba":{"min":-9,"max":9,"step":1},"mg":{"min":-9,"max":9,"step":1}}}}"#,
+            #"{"wbshift":{"value":{"ba":false,"mg":0},"ability":{"ba":{"min":-9,"max":9,"step":1},"mg":{"min":-9,"max":9,"step":1}}}}"#,
+        ]
+        for body in malformedSettings {
+            let transport = MockCameraHTTPTransport()
+            await transport.enqueueJSON(
+                path: "/ccapi",
+                body: #"{"ver100":[{"path":"/shooting/settings","get":true},{"path":"/shooting/settings/wbshift","put":true}]}"#
+            )
+            await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: body)
+            let client = try CCAPIClient(
+                baseURL: "http://192.168.1.2:8080",
+                mode: .camera,
+                transport: transport
+            )
+
+            let capabilities = try await client.capabilities()
+
+            XCTAssertFalse(capabilities.settings.contains { $0.key.hasPrefix("wbshift.") })
+        }
+    }
+
+    func testMediaDownloadRejectsCrossOriginCameraResource() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let item = CameraMediaItem(
+            id: "http://attacker.invalid/ccapi/ver100/contents/IMG_0001.JPG",
+            name: "IMG_0001.JPG",
+            kind: "image"
+        )
+
+        do {
+            _ = try await client.downloadMedia(item, to: destination)
+            XCTFail("Expected same-origin validation")
+        } catch {
+            XCTAssertEqual(
+                error as? CCAPIError,
+                .outsideCameraOrigin("http://attacker.invalid/ccapi/ver100/contents/IMG_0001.JPG")
+            )
+        }
+    }
+
+    func testMediaDownloadRetriesMainVariantAndMovesTemporaryFile() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        let path = "/ccapi/ver100/contents/card1/100CANON/IMG_0001.CR3"
+        await transport.enqueueDownload(
+            path: path,
+            status: 200,
+            body: Data(#"{"kind":"metadata"}"#.utf8)
+        )
+        let media = Data([9, 8, 7, 6])
+        await transport.enqueueDownload(
+            path: "\(path)?kind=main",
+            headers: ["content-type": "image/x-canon-cr3"],
+            body: media
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+        let destination = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let progress = DownloadProgressRecorder()
+        defer { try? FileManager.default.removeItem(at: destination) }
+
+        let result = try await client.downloadMedia(
+            CameraMediaItem(id: path, name: "IMG_0001.CR3", kind: "raw", sizeBytes: 4),
+            to: destination,
+            progress: { progress.record($0) }
+        )
+
+        XCTAssertEqual(try Data(contentsOf: destination), media)
+        XCTAssertEqual(result.bytesTransferred, 4)
+        XCTAssertEqual(result.contentType, "image/x-canon-cr3")
+        XCTAssertEqual(
+            progress.values().last,
+            CameraMediaTransferProgress(bytesTransferred: 4, totalBytes: 4)
+        )
+        let downloadPaths = (await transport.requests()).map(\.path).filter { $0.contains("IMG_0001.CR3") }
+        XCTAssertEqual(downloadPaths, [path, "\(path)?kind=main"])
+    }
+
+    func testMediaDeleteUsesAdvertisedDeleteOnExactCameraPath() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        let path = "/ccapi/ver100/contents/card1/100CANON/IMG_0001.JPG"
+        await transport.enqueue(method: "DELETE", path: path, status: 204, body: Data())
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        try await client.deleteMedia(
+            CameraMediaItem(id: "http://192.168.1.2:8080\(path)?kind=main", name: "IMG_0001.JPG", kind: "image")
+        )
+
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map(\.method), ["GET", "DELETE"])
+        XCTAssertEqual(requests.last?.path, path)
+    }
+
+    func testMediaDeleteRequiresAdvertisedDeleteWithoutSendingCommand() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/contents","get":true}]}"#
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        do {
+            try await client.deleteMedia(
+                CameraMediaItem(id: "/ccapi/ver100/contents/card1/IMG_0001.JPG", name: "IMG_0001.JPG", kind: "image")
+            )
+            XCTFail("Expected unsupported media deletion")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .unsupported(.mediaDelete))
+        }
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map(\.method), ["GET"])
+    }
+
+    func testMediaMetadataUsesAdvertisedCanonPutAndVerifiesReadback() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        let path = "/ccapi/ver100/contents/card1/100CANON/IMG_0001.JPG"
+        let item = CameraMediaItem(id: path, name: "IMG_0001.JPG", kind: "image")
+        await transport.enqueueJSON(
+            path: "\(path)?kind=info",
+            body: #"{"filesize":1234,"protect":"disable","rating":"off","rotate":"0","lastmodifieddate":"2026-08-05T10:00:00+08:00"}"#
+        )
+        await transport.enqueueJSON(method: "PUT", path: path, body: "{}")
+        await transport.enqueueJSON(
+            path: "\(path)?kind=info",
+            body: #"{"protect":"enable","rating":"off","rotate":"0"}"#
+        )
+        await transport.enqueueJSON(method: "PUT", path: path, body: "{}")
+        await transport.enqueueJSON(
+            path: "\(path)?kind=info",
+            body: #"{"protect":"enable","rating":"5","rotate":"0"}"#
+        )
+        await transport.enqueueJSON(method: "PUT", path: path, body: "{}")
+        await transport.enqueueJSON(
+            path: "\(path)?kind=info",
+            body: #"{"protect":"enable","rating":"5","rotate":"270"}"#
+        )
+        await transport.enqueueJSON(method: "PUT", path: path, body: "{}")
+        await transport.enqueueJSON(
+            path: "\(path)?kind=info",
+            body: #"{"protect":"enable","rating":"5","rotate":"270","archive":"enable"}"#
+        )
+        await transport.enqueueJSON(method: "PUT", path: path, body: "{}")
+        await transport.enqueueJSON(
+            path: "\(path)?kind=info",
+            body: #"{"protect":"enable","rating":"5","rotate":"270","archive":"disable"}"#
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let info = try await client.mediaInfo(item)
+        XCTAssertEqual(info.sizeBytes, 1_234)
+        XCTAssertEqual(info.protected, false)
+        XCTAssertEqual(info.rating, 0)
+        XCTAssertEqual(info.rotationDegrees, 0)
+        let protected = try await client.setMediaProtection(info, enabled: true)
+        let rated = try await client.setMediaRating(protected, rating: 5)
+        let rotated = try await client.setMediaRotation(rated, degrees: 270)
+        let archived = try await client.setMediaArchive(rotated, enabled: true)
+        let unarchived = try await client.setMediaArchive(archived, enabled: false)
+        XCTAssertEqual(protected.protected, true)
+        XCTAssertEqual(rated.rating, 5)
+        XCTAssertEqual(rotated.rotationDegrees, 270)
+        XCTAssertEqual(archived.archived, true)
+        XCTAssertEqual(unarchived.archived, false)
+
+        let writes = await transport.requests().filter { $0.method == "PUT" && $0.path == path }
+        let payloads = try writes.map { request -> [String: String] in
+            let body = try XCTUnwrap(request.body)
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: body) as? [String: String])
+        }
+        XCTAssertEqual(payloads[0], ["action": "protect", "value": "enable"])
+        XCTAssertEqual(payloads[1], ["action": "rating", "value": "5"])
+        XCTAssertEqual(payloads[2], ["action": "rotate", "value": "270"])
+        XCTAssertEqual(payloads[3], ["action": "archive", "value": "enable"])
+        XCTAssertEqual(payloads[4], ["action": "archive", "value": "disable"])
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: settings)
+        let capabilities = try await client.capabilities()
+        XCTAssertTrue(capabilities.evidence.observedFeatures.contains(.mediaProtect))
+        XCTAssertTrue(capabilities.evidence.observedFeatures.contains(.mediaRating))
+        XCTAssertTrue(capabilities.evidence.observedFeatures.contains(.mediaRotate))
+        XCTAssertTrue(capabilities.evidence.observedFeatures.contains(.mediaArchive))
+    }
+
+    func testSimulatorMediaArchiveParsesBooleanState() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi/media",
+            body: #"{"items":[{"id":"SIM_0001.PNG","name":"SIM_0001.PNG","kind":"image","archive":true}]}"#
+        )
+        let client = try CCAPIClient(
+            baseURL: "http://127.0.0.1:18080",
+            mode: .simulator,
+            transport: transport
+        )
+
+        let items = try await client.listMedia()
+
+        XCTAssertEqual(items.first?.archived, true)
+    }
+
+    func testRealMediaListRemembersUnsupportedDescendingOrderAndReversesPlainPages() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/contents","get":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/contents?kind=number", body: #"{"pagenumber":3}"#)
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/contents?page=1&order=desc",
+            status: 400,
+            body: #"{"message":"Invalid parameter"}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/contents?page=1",
+            body: #"{"path":["/ccapi/ver100/contents/card1/A1.JPG","/ccapi/ver100/contents/card1/A2.JPG"]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/contents?page=3",
+            body: #"{"path":["/ccapi/ver100/contents/card1/C1.JPG","/ccapi/ver100/contents/card1/C2.JPG"]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/contents?page=2",
+            body: #"{"path":["/ccapi/ver100/contents/card1/B1.JPG","/ccapi/ver100/contents/card1/B2.JPG"]}"#
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let items = try await client.listMedia()
+
+        XCTAssertEqual(items.map(\.name), ["C2.JPG", "C1.JPG", "B2.JPG", "B1.JPG", "A2.JPG", "A1.JPG"])
+        let requests = await transport.requests()
+        XCTAssertEqual(
+            requests.map(\.path),
+            [
+                "/ccapi",
+                "/ccapi/ver100/contents?kind=number",
+                "/ccapi/ver100/contents?page=1&order=desc",
+                "/ccapi/ver100/contents?page=1",
+                "/ccapi/ver100/contents?page=3",
+                "/ccapi/ver100/contents?page=2",
+            ]
+        )
+    }
+
+    func testRealMediaListReturnsMoreThan500ItemsPerContainer() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/contents","get":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/contents?kind=number", body: #"{"pagenumber":2}"#)
+        for page in 1...2 {
+            let range = page == 1 ? 1...500 : 501...501
+            let paths = range.map { index in
+                "\"/ccapi/ver100/contents/card1/IMG_\(String(format: "%04d", index)).JPG\""
+            }.joined(separator: ",")
+            await transport.enqueueJSON(
+                path: "/ccapi/ver100/contents?page=\(page)&order=desc",
+                body: "{\"path\":[\(paths)]}"
+            )
+        }
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let items = try await client.listMedia()
+
+        XCTAssertEqual(items.count, 501)
+        XCTAssertEqual(items.first?.name, "IMG_0001.JPG")
+        XCTAssertEqual(items.last?.name, "IMG_0501.JPG")
+        let requests = await transport.requests()
+        XCTAssertEqual(
+            requests.map(\.path),
+            [
+                "/ccapi",
+                "/ccapi/ver100/contents?kind=number",
+                "/ccapi/ver100/contents?page=1&order=desc",
+                "/ccapi/ver100/contents?page=2&order=desc",
+            ]
+        )
+    }
+
+    func testRealMediaListStopsPagingAfterMaximumItemsAndBoundsProgress() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/contents","get":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/contents?kind=number", body: #"{"pagenumber":3}"#)
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/contents?page=1&order=desc",
+            body: #"{"path":["/ccapi/ver100/contents/card1/IMG_0001.JPG","/ccapi/ver100/contents/card1/IMG_0002.JPG"]}"#
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+        let progress = MediaListProgressRecorder()
+
+        let items = try await client.listMedia(maximumItems: 2) { partialItems in
+            await progress.record(partialItems)
+        }
+
+        XCTAssertEqual(items.map(\.name), ["IMG_0001.JPG", "IMG_0002.JPG"])
+        let snapshots = await progress.values()
+        XCTAssertEqual(snapshots.map(\.count), [2])
+        let requests = await transport.requests()
+        let requestPaths = requests.map(\.path)
+        XCTAssertEqual(
+            requestPaths,
+            [
+                "/ccapi",
+                "/ccapi/ver100/contents?kind=number",
+                "/ccapi/ver100/contents?page=1&order=desc",
+            ]
+        )
+    }
+
+    func testRealMediaListTraversesMoreThanOneHundredPages() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/contents","get":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/contents?kind=number", body: #"{"pagenumber":101}"#)
+        for page in 1...101 {
+            let name = String(format: "IMG_%04d.JPG", page)
+            await transport.enqueueJSON(
+                path: "/ccapi/ver100/contents?page=\(page)&order=desc",
+                body: "{\"path\":[\"/ccapi/ver100/contents/card1/\(name)\"]}"
+            )
+        }
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let items = try await client.listMedia()
+
+        XCTAssertEqual(items.count, 101)
+        XCTAssertEqual(items.first?.name, "IMG_0001.JPG")
+        XCTAssertEqual(items.last?.name, "IMG_0101.JPG")
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.count, 103)
+        XCTAssertEqual(requests.last?.path, "/ccapi/ver100/contents?page=101&order=desc")
+        let remainingResponses = await transport.remainingResponses()
+        XCTAssertEqual(remainingResponses, 0)
+    }
+
+    func testRealMediaListPublishesEveryCompletedPage() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/contents","get":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/contents?kind=number", body: #"{"pagenumber":3}"#)
+        for page in 1...3 {
+            await transport.enqueueJSON(
+                path: "/ccapi/ver100/contents?page=\(page)&order=desc",
+                body: "{\"path\":[\"/ccapi/ver100/contents/card1/IMG_000\(page).JPG\"]}"
+            )
+        }
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+        let progress = MediaListProgressRecorder()
+
+        let items = try await client.listMedia { partialItems in
+            await progress.record(partialItems)
+        }
+
+        let snapshots = await progress.values()
+        XCTAssertEqual(snapshots.map(\.count), [1, 2, 3])
+        XCTAssertEqual(snapshots.map { $0.last?.name }, ["IMG_0001.JPG", "IMG_0002.JPG", "IMG_0003.JPG"])
+        XCTAssertEqual(items.map(\.name), ["IMG_0001.JPG", "IMG_0002.JPG", "IMG_0003.JPG"])
+    }
+
+    func testRealMediaListCancellationAfterFirstPageStopsFurtherRequests() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/contents","get":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/contents?kind=number", body: #"{"pagenumber":3}"#)
+        for page in 1...3 {
+            await transport.enqueueJSON(
+                path: "/ccapi/ver100/contents?page=\(page)&order=desc",
+                body: "{\"path\":[\"/ccapi/ver100/contents/card1/IMG_000\(page).JPG\"]}"
+            )
+        }
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let traversal = Task {
+            try await client.listMedia { _ in
+                withUnsafeCurrentTask { task in task?.cancel() }
+            }
+        }
+        do {
+            _ = try await traversal.value
+            XCTFail("Expected media traversal cancellation")
+        } catch is CancellationError {
+        }
+
+        let requests = await transport.requests()
+        XCTAssertEqual(
+            requests.map(\.path),
+            [
+                "/ccapi",
+                "/ccapi/ver100/contents?kind=number",
+                "/ccapi/ver100/contents?page=1&order=desc",
+            ]
+        )
+        let remainingResponses = await transport.remainingResponses()
+        XCTAssertEqual(remainingResponses, 2)
+    }
+
+    func testRealMediaListRejectsNegativePageCount() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/contents","get":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/contents?kind=number", body: #"{"pagenumber":-1}"#)
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        do {
+            _ = try await client.listMedia()
+            XCTFail("Expected the negative page count to be rejected")
+        } catch {
+            XCTAssertTrue(String(describing: error).contains("negative media page count"))
+        }
+        let remainingResponses = await transport.remainingResponses()
+        XCTAssertEqual(remainingResponses, 0)
+    }
+
+    func testRealMediaListFairlyMergesSiblingMediaContainers() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/contents","get":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/contents?kind=number", body: #"{"pagenumber":1}"#)
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/contents?page=1&order=desc",
+            body: #"{"path":["/ccapi/ver100/contents/card1/photos","/ccapi/ver100/contents/card1/videos"]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/contents/card1/photos?kind=number",
+            body: #"{"pagenumber":2}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/contents/card1/photos?page=1&order=desc",
+            body: #"{"path":["/ccapi/ver100/contents/card1/photos/P2.JPG","/ccapi/ver100/contents/card1/photos/P1.JPG"]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/contents/card1/photos?page=2&order=desc",
+            body: #"{"path":["/ccapi/ver100/contents/card1/photos/P0.JPG"]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/contents/card1/videos?kind=number",
+            body: #"{"pagenumber":1}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/contents/card1/videos?page=1&order=desc",
+            body: #"{"path":["/ccapi/ver100/contents/card1/videos/V2.MP4","/ccapi/ver100/contents/card1/videos/V1.MP4"]}"#
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let items = try await client.listMedia()
+
+        XCTAssertEqual(items.map(\.name), ["P2.JPG", "V2.MP4", "P1.JPG", "V1.MP4", "P0.JPG"])
+        XCTAssertEqual(items.map(\.kind), ["image", "video", "image", "video", "image"])
+        let remainingResponses = await transport.remainingResponses()
+        XCTAssertEqual(remainingResponses, 0)
+    }
+
+    func testBoundedRealMediaListKeepsPhotoAndVideoSiblingsFair() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/contents","get":true}]}"#
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/contents?kind=number", body: #"{"pagenumber":1}"#)
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/contents?page=1&order=desc",
+            body: #"{"path":["/ccapi/ver100/contents/card1/photos","/ccapi/ver100/contents/card1/videos"]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/contents/card1/photos?kind=number",
+            body: #"{"pagenumber":2}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/contents/card1/photos?page=1&order=desc",
+            body: #"{"path":["/ccapi/ver100/contents/card1/photos/P2.JPG","/ccapi/ver100/contents/card1/photos/P1.JPG"]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/contents/card1/videos?kind=number",
+            body: #"{"pagenumber":1}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/contents/card1/videos?page=1&order=desc",
+            body: #"{"path":["/ccapi/ver100/contents/card1/videos/V2.MP4","/ccapi/ver100/contents/card1/videos/V1.MP4"]}"#
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let items = try await client.listMedia(maximumItems: 2)
+
+        XCTAssertEqual(items.map(\.name), ["P2.JPG", "V2.MP4"])
+        XCTAssertEqual(items.map(\.kind), ["image", "video"])
+        let requests = await transport.requests()
+        let requestPaths = requests.map(\.path)
+        XCTAssertEqual(
+            requestPaths,
+            [
+                "/ccapi",
+                "/ccapi/ver100/contents?kind=number",
+                "/ccapi/ver100/contents?page=1&order=desc",
+                "/ccapi/ver100/contents/card1/photos?kind=number",
+                "/ccapi/ver100/contents/card1/photos?page=1&order=desc",
+                "/ccapi/ver100/contents/card1/videos?kind=number",
+                "/ccapi/ver100/contents/card1/videos?page=1&order=desc",
+            ]
+        )
+    }
+
+    func testMediaMetadataRequiresAdvertisedContentsPut() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/contents","get":true}]}"#
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+        let item = CameraMediaItem(
+            id: "/ccapi/ver100/contents/card1/IMG_0001.JPG",
+            name: "IMG_0001.JPG",
+            kind: "image"
+        )
+
+        do {
+            _ = try await client.setMediaRating(item, rating: 4)
+            XCTFail("Expected unsupported media rating")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .unsupported(.mediaRating))
+        }
+        do {
+            _ = try await client.setMediaArchive(item, enabled: true)
+            XCTFail("Expected unsupported media archive")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .unsupported(.mediaArchive))
+        }
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map(\.method), ["GET"])
+    }
+
+    func testDeviceStatusUsesAdvertisedStrictCanonLensAndTemperaturePayloads() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: deviceStatusDiscovery)
+        await enqueueDeviceStatus(
+            on: transport,
+            temperature: "frameratedown_and_restrictionmovierecording"
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let status = try await client.status()
+        let capabilities = try await client.capabilities()
+
+        XCTAssertEqual(status.lens, LensStatus(mounted: true, name: "RF24-105mm F4 L IS USM"))
+        XCTAssertEqual(status.temperature, .frameRateDownAndRestrictionMovieRecording)
+        XCTAssertEqual(status.recordableShots, 2_418)
+        XCTAssertNil(status.remainingRecordingSeconds)
+        XCTAssertEqual(status.temperature?.frameRateReduced, true)
+        XCTAssertEqual(status.temperature?.movieRecordingAllowed, false)
+        XCTAssertTrue(capabilities.matrix.supports(.lensStatus))
+        XCTAssertTrue(capabilities.matrix.supports(.temperatureStatus))
+        XCTAssertTrue(capabilities.matrix.supports(.recordableStatus))
+    }
+
+    func testMalformedAdvertisedDeviceStatusRemainsPlanned() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: deviceStatusDiscovery)
+        await enqueueDeviceStatus(
+            on: transport,
+            recordable: #"{"recordableshots":true,"remainingtime":-1}"#,
+            lens: #"{"mount":"true","name":"RF24-105mm"}"#,
+            temperature: "hot"
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let status = try await client.status()
+        let capabilities = try await client.capabilities()
+
+        XCTAssertNil(status.lens)
+        XCTAssertNil(status.temperature)
+        XCTAssertNil(status.recordableShots)
+        XCTAssertNil(status.remainingRecordingSeconds)
+        XCTAssertFalse(capabilities.matrix.supports(.lensStatus))
+        XCTAssertFalse(capabilities.matrix.supports(.temperatureStatus))
+        XCTAssertFalse(capabilities.matrix.supports(.recordableStatus))
+        XCTAssertTrue(capabilities.matrix.planned.contains(.lensStatus))
+        XCTAssertTrue(capabilities.matrix.planned.contains(.temperatureStatus))
+        XCTAssertTrue(capabilities.matrix.planned.contains(.recordableStatus))
+    }
+
+    func testOversizedAdvertisedLensNameRemainsPlanned() async throws {
+        let transport = MockCameraHTTPTransport()
+        let oversizedName = String(repeating: "R", count: 513)
+        await transport.enqueueJSON(path: "/ccapi", body: deviceStatusDiscovery)
+        await enqueueDeviceStatus(
+            on: transport,
+            lens: "{\"mount\":true,\"name\":\"" + oversizedName + "\"}"
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let status = try await client.status()
+        let capabilities = try await client.capabilities()
+
+        XCTAssertNil(status.lens)
+        XCTAssertFalse(capabilities.matrix.supports(.lensStatus))
+        XCTAssertTrue(capabilities.matrix.planned.contains(.lensStatus))
+    }
+
+    func testTemperatureRestrictionRefreshPreventsStillCaptureCommand() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(
+            path: "/ccapi",
+            body: #"{"ver100":[{"path":"/devicestatus/temperature","get":true},{"path":"/shooting/control/shutterbutton","post":true}]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/devicestatus/temperature",
+            body: #"{"status":"disablerelease"}"#
+        )
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        do {
+            _ = try await client.captureStill()
+            XCTFail("Expected temperature restriction")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .temperatureRestriction(.stillCapture))
+        }
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/devicestatus/temperature",
+            body: #"{"status":"hot"}"#
+        )
+        do {
+            _ = try await client.captureStill()
+            XCTFail("Expected the last valid temperature restriction to remain active")
+        } catch {
+            XCTAssertEqual(error as? CCAPIError, .temperatureRestriction(.stillCapture))
+        }
+
+        let requests = await transport.requests()
+        XCTAssertEqual(requests.map(\.method), ["GET", "GET", "GET"])
+    }
+
+    func testTemperatureRestrictionDoesNotBlockRecordingStop() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: deviceStatusDiscovery)
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/devicestatus/temperature",
+            body: #"{"status":"normal"}"#
+        )
+        await transport.enqueue(method: "POST", path: "/ccapi/ver100/shooting/control/recbutton", status: 204)
+        await enqueueDeviceStatus(on: transport)
+        await transport.enqueue(method: "POST", path: "/ccapi/ver100/shooting/control/recbutton", status: 204)
+        await enqueueDeviceStatus(on: transport, temperature: "restrictionmovierecording")
+        let client = try CCAPIClient(baseURL: "http://192.168.1.2:8080", mode: .camera, transport: transport)
+
+        let started = try await client.startRecording()
+        XCTAssertEqual(started.recording, true)
+        let stopped = try await client.stopRecording()
+        XCTAssertEqual(stopped.recording, false)
+
+        let stop = (await transport.requests()).last { request in
+            request.method == "POST" && request.path == "/ccapi/ver100/shooting/control/recbutton"
+        }
+        let stopBody = try XCTUnwrap(stop?.body)
+        let stopJSON = try XCTUnwrap(JSONSerialization.jsonObject(with: stopBody) as? [String: String])
+        XCTAssertEqual(stopJSON, ["action": "stop"])
+    }
+
+    func testCanonTemperatureStatusesExposeDocumentedRestrictions() {
+        XCTAssertEqual(CameraTemperatureStatus.allCases.count, 12)
+        XCTAssertFalse(CameraTemperatureStatus.disableLiveView.liveViewAllowed)
+        XCTAssertFalse(CameraTemperatureStatus.disableRelease.stillCaptureAllowed)
+        XCTAssertFalse(CameraTemperatureStatus.restrictionMovieRecording.movieRecordingAllowed)
+        XCTAssertTrue(CameraTemperatureStatus.frameRateDown.frameRateReduced)
+        XCTAssertTrue(CameraTemperatureStatus.stillQualityWarning.stillQualityWarning)
+        XCTAssertTrue(CameraTemperatureStatus.warning.temperatureWarning)
+        XCTAssertTrue(CameraTemperatureStatus.normal.isNormal)
+    }
+
+    func testBasicAuthenticationIsSentButDiagnosticReportRedactsSecrets() async throws {
+        let transport = MockCameraHTTPTransport()
+        await transport.enqueueJSON(path: "/ccapi", body: discovery)
+        let client = try CCAPIClient(
+            baseURL: "http://192.168.1.2:8080",
+            mode: .camera,
+            username: "camera-user",
+            password: "secret",
+            transport: transport
+        )
+
+        try await client.initialize()
+        let requests = await transport.requests()
+        let request = try XCTUnwrap(requests.first)
+        XCTAssertTrue(request.headers.values.contains { $0.hasPrefix("Basic ") })
+        let report = await client.diagnosticReport(
+            snapshot: nil,
+            lastError: "Authorization: Basic abc password=secret token=abc"
+        )
+        XCTAssertFalse(report.contains("camera-user"))
+        XCTAssertFalse(report.contains("secret"))
+        XCTAssertFalse(report.contains("Basic abc"))
+        XCTAssertTrue(report.contains("[redacted]"))
+    }
+
+    func testDiagnosticReportIncludesCapabilityEvidence() throws {
+        let windowsHome = "C:/" + "Users/private/capture.jpg"
+        let networkHome = "\\\\" + "PRIVATE-SERVER\\private\\capture.jpg"
+        let capabilities = CameraCapabilities(
+            settings: [],
+            matrix: CapabilityMatrix(supported: [.cameraIdentity, .liveView, .stillCapture]),
+            liveView: LiveViewCapabilities(),
+            profile: CameraProfile.from(modelName: "Canon EOS R6 Mark III"),
+            evidence: CameraCapabilityEvidence(
+                source: "GET /ccapi",
+                protocolVersions: ["ver100"],
+                advertisedCommands: ["POST /ccapi/ver100/shooting/control/shutterbutton"],
+                writableSettings: ["iso", "tv"],
+                observedFeatures: [.cameraIdentity, .liveView],
+                discoveryTrace: [
+                    CameraDiscoveryAttempt(
+                        endpoint: "GET /ccapi",
+                        outcome: "NO_API_LIST",
+                        httpStatus: 200,
+                        responseKeys: ["value"]
+                    ),
+                    CameraDiscoveryAttempt(
+                        endpoint: "GET /ccapi/ver100/topurlfordev",
+                        outcome: "OPERATIONS",
+                        httpStatus: 200,
+                        responseKeys: ["ver100"],
+                        protocolVersions: ["ver100"],
+                        advertisedOperationCount: 17
+                    ),
+                ]
+            )
+        )
+        let snapshot = CameraSnapshot(
+            info: CameraInfo(model: "Canon EOS R6 Mark III", serial: "PRIVATE-CAMERA-SERIAL", api: "ccapi"),
+            status: CameraStatus(
+                mediaAvailable: true,
+                storageTotalBytes: 64_000,
+                storageFreeBytes: 32_000,
+                storageFreeImages: 1_234,
+                storageDeviceCount: 1
+            ),
+            capabilities: capabilities
+        )
+
+        let report = CCAPIDiagnosticReport.make(
+            baseURL: try XCTUnwrap(URL(string: "http://192.168.1.2:8080")),
+            mode: .camera,
+            versions: ["/ccapi/ver100"],
+            snapshot: snapshot,
+            lastError: "Camera PRIVATE-CAMERA-SERIAL failed at \(windowsHome), \(networkHome) and /private/var/mobile/frame.jpg",
+            metadata: DiagnosticReportMetadata(
+                productVersion: "9.8.7-test",
+                generatedAt: "2026-07-29T00:00:00Z"
+            )
+        )
+
+        XCTAssertTrue(report.contains("reportSchema=1"))
+        XCTAssertTrue(report.contains("generatedAt=2026-07-29T00:00:00Z"))
+        XCTAssertTrue(report.contains("productVersion=9.8.7-test"))
+        XCTAssertTrue(report.contains("serial=[redacted]"))
+        XCTAssertFalse(report.contains("PRIVATE-CAMERA-SERIAL"))
+        XCTAssertFalse(report.contains("C:/" + "Users"))
+        XCTAssertFalse(report.contains("PRIVATE-SERVER"))
+        XCTAssertFalse(report.contains("/private/var"))
+        XCTAssertTrue(report.contains("[local-path]"))
+        XCTAssertTrue(report.contains("capabilitySource=GET /ccapi"))
+        XCTAssertTrue(report.contains("discoveryAttemptCount=2"))
+        XCTAssertTrue(report.contains("discoveryAttempt1=endpoint=GET /ccapi; outcome=NO_API_LIST"))
+        XCTAssertTrue(report.contains("discoveryAttempt2=endpoint=GET /ccapi/ver100/topurlfordev; outcome=OPERATIONS"))
+        XCTAssertTrue(report.contains("advertisedCommandCount=1"))
+        XCTAssertTrue(report.contains("POST /ccapi/ver100/shooting/control/shutterbutton"))
+        XCTAssertTrue(report.contains("writableSettings=iso, tv"))
+        XCTAssertTrue(report.contains("observedFeatures=CAMERA_IDENTITY, LIVE_VIEW"))
+        XCTAssertTrue(report.contains("advertisedFeatureCount=3"))
+        XCTAssertTrue(report.contains("observedFeatureCount=2"))
+        XCTAssertTrue(report.contains("validatedAdvertisedFeatureCount=2"))
+        XCTAssertTrue(report.contains("unverifiedAdvertisedFeatures=STILL_CAPTURE"))
+        XCTAssertTrue(report.contains("observedWithoutAdvertisement=none"))
+        XCTAssertTrue(report.contains("storageTotalBytes=64000"))
+        XCTAssertTrue(report.contains("storageFreeBytes=32000"))
+        XCTAssertTrue(report.contains("storageFreeImages=1234"))
+        XCTAssertTrue(report.contains("storageDevices=1"))
+    }
+
+    private func enqueueStatus(on transport: MockCameraHTTPTransport, prefix: String = "/ccapi/ver100") async {
+        await transport.enqueueJSON(path: "\(prefix)/devicestatus/batterylist", body: #"{"batterylist":[{"level":89}]}"#)
+        await transport.enqueueJSON(
+            path: "\(prefix)/devicestatus/storage",
+            body: #"{"storagelist":[{"name":"card1","maxsize":64000000000,"spacesize":32000000000,"freeimages":-1},{"name":"card2","capacity":128000000000,"freebytes":64000000000,"remainingimages":2400}]}"#
+        )
+        await transport.enqueueJSON(path: "\(prefix)/shooting/settings", body: settings)
+    }
+
+    private func enqueueFileNaming(
+        on transport: MockCameraHTTPTransport,
+        stillUserSetting1: String = "IMG_",
+        movieReelNumber: Int = 1
+    ) async {
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/functions/filename/stills/filename",
+            body: #"{"value":"preset_code","ability":["preset_code","usersetting1","usersetting2"]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/functions/filename/stills/usersetting1",
+            body: "{\"usersetting1\":\"\(stillUserSetting1)\"}"
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/functions/filename/stills/usersetting2",
+            body: #"{"usersetting2":"EOS"}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/functions/filename/movies/index",
+            body: #"{"index":"A_"}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/functions/filename/movies/reelnum",
+            body: "{\"value\":\(movieReelNumber),\"ability\":{\"min\":1,\"max\":9999,\"step\":1}}"
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/functions/filename/movies/clipnum",
+            body: #"{"value":1,"ability":{"min":1,"max":999,"step":1}}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/functions/filename/movies/userdefined",
+            body: #"{"userdefined":"EOS01"}"#
+        )
+    }
+
+    private func enqueueDeviceStatus(
+        on transport: MockCameraHTTPTransport,
+        recordable: String = #"{"recordableshots":2418,"remainingtime":null}"#,
+        lens: String = #"{"mount":true,"name":"RF24-105mm F4 L IS USM"}"#,
+        temperature: String = "normal"
+    ) async {
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/devicestatus/batterylist",
+            body: #"{"batterylist":[{"level":89}]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/devicestatus/storage",
+            body: #"{"storagelist":[{"name":"card1","spacesize":32000000000}]}"#
+        )
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/shooting/information/recordable",
+            body: recordable
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/devicestatus/lens", body: lens)
+        await transport.enqueueJSON(
+            path: "/ccapi/ver100/devicestatus/temperature",
+            body: "{\"status\":\"\(temperature)\"}"
+        )
+        await transport.enqueueJSON(path: "/ccapi/ver100/shooting/settings", body: settings)
+    }
+
+    private func detailedLiveView(jpeg: Data) -> Data {
+        let info = Data(
+            #"{"liveview":{"image":{"positionx":100,"positiony":200,"positionwidth":6000,"positionheight":4000}}}"#.utf8
+        )
+        return detailPacket(type: 0x00, payload: jpeg) + detailPacket(type: 0x01, payload: info)
+    }
+
+    private func detailPacket(type: UInt8, payload: Data) -> Data {
+        let size = UInt32(payload.count).bigEndian
+        var result = Data([0xFF, 0x00, type])
+        withUnsafeBytes(of: size) { result.append(contentsOf: $0) }
+        result.append(payload)
+        result.append(contentsOf: [0xFF, 0xFF])
+        return result
+    }
+}

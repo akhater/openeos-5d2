@@ -1,0 +1,3051 @@
+from __future__ import annotations
+
+import base64
+import json
+import mimetypes
+import os
+import queue
+import re
+import shutil
+import subprocess
+import tempfile
+import threading
+import time
+import uuid
+from collections.abc import Callable, Iterator, Mapping
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from pathlib import Path, PureWindowsPath
+from typing import Protocol
+
+from .errors import BridgeError, unsupported
+from .local_media import (
+    LocalCaptureStore,
+    default_capture_directory,
+    is_host_media_id,
+    is_previewable_media,
+    preview_content_type,
+)
+from .media_upload import validate_upload_request
+from .models import (
+    BatteryStatus,
+    CameraCapabilities,
+    CameraDescriptor,
+    CameraEvent,
+    CameraFeature,
+    CameraInfo,
+    CameraSetting,
+    CameraStatus,
+    CapabilityEvidence,
+    ExposureState,
+    FileNamingField,
+    FileNamingState,
+    FocusResult,
+    LiveViewCapabilities,
+    LiveViewMagnificationResult,
+    LiveViewStartRequest,
+    MediaItem,
+    StorageStatus,
+    camera_profile,
+)
+
+ENGINE_NAME = "libgphoto2"
+MAX_COMMAND_OUTPUT_BYTES = 32 * 1024 * 1024
+MAX_COMMAND_STDERR_BYTES = 256 * 1024
+MAX_MEDIA_THUMBNAIL_BYTES = 8 * 1024 * 1024
+MAX_MEDIA_PREVIEW_BYTES = 32 * 1024 * 1024
+MAX_CAPABILITY_EVIDENCE_ITEMS = 256
+MAX_CAPABILITY_EVIDENCE_ITEM_CHARS = 512
+CONFIG_REFRESH_SECONDS = 1.0
+CAMERA_CLOCK_SYNC_TOLERANCE_SECONDS = 10
+MAX_BRIDGE_LIVE_VIEW_FPS = 30
+MAX_PREVIEW_FALLBACK_FPS = 5
+MAX_LIVE_VIEW_FRAME_BYTES = 16 * 1024 * 1024
+MAX_LIVE_VIEW_BUFFER_BYTES = MAX_LIVE_VIEW_FRAME_BYTES + 64 * 1024
+TEXT_METADATA_MAX_BYTES = 255
+LIVE_VIEW_FIRST_FRAME_TIMEOUT_SECONDS = 10.0
+LIVE_VIEW_FRAME_TIMEOUT_SECONDS = 10.0
+LIVE_VIEW_STREAM_TIMEOUT_SECONDS = 24 * 60 * 60
+GPHOTO_EVENT_PROBE_ARGUMENT = "1ms"
+GPHOTO_EVENT_WAIT_ARGUMENT = "250ms"
+GPHOTO_EVENT_IDLE_SECONDS = 0.25
+GPHOTO_EVENT_COMMAND_TIMEOUT_SECONDS = 8.0
+CANON_AUTO_LIGHTING_OPTIMIZER_VALUES = frozenset(
+    {
+        "standard",
+        "standard (disabled in manual exposure)",
+        "low",
+        "low (disabled in manual exposure)",
+        "off",
+        "off (disabled in manual exposure)",
+        "high",
+        "high (disabled in manual exposure)",
+        "x1",
+        "x2",
+        "x3",
+    }
+)
+
+
+@dataclass(frozen=True)
+class CommandOutput:
+    stdout: bytes
+    stderr: str = ""
+
+    @property
+    def text(self) -> str:
+        return _decode_process_text(self.stdout)
+
+
+@dataclass(frozen=True)
+class GPhotoCommand:
+    prefix: tuple[str, ...]
+    host_mode: str
+    wsl_distro: str | None = None
+
+    @property
+    def display(self) -> str:
+        if self.host_mode == "wsl":
+            distro = f" ({self.wsl_distro})" if self.wsl_distro else ""
+            return f"gphoto2 via WSL{distro}"
+        return self.prefix[0]
+
+
+@dataclass(frozen=True)
+class WslHostState:
+    distributions: tuple[str, ...] = ()
+    usbipd_available: bool = False
+    error: str | None = None
+
+
+def resolve_gphoto_command(
+    binary: str | None = None,
+    *,
+    environment: Mapping[str, str] | None = None,
+    platform_name: str | None = None,
+    which: Callable[[str], str | None] = shutil.which,
+) -> GPhotoCommand:
+    configured_environment = environment if environment is not None else os.environ
+    explicit = binary or configured_environment.get("OPEN_EOS_GPHOTO2")
+    if explicit:
+        return GPhotoCommand((explicit,), "native")
+
+    native = which("gphoto2")
+    if native:
+        return GPhotoCommand((native,), "native")
+
+    if (platform_name or os.name) == "nt":
+        wsl = which("wsl.exe")
+        if wsl:
+            distro = configured_environment.get("OPEN_EOS_GPHOTO2_WSL_DISTRO") or None
+            prefix = [wsl]
+            if distro:
+                prefix.extend(("--distribution", distro))
+            prefix.extend(("--exec", "gphoto2"))
+            return GPhotoCommand(tuple(prefix), "wsl", distro)
+
+    return GPhotoCommand(("gphoto2",), "native")
+
+
+class GPhotoRunner(Protocol):
+    def health(self) -> tuple[bool, str | None, str | None]: ...
+
+    def run(self, arguments: list[str], *, timeout: float = 30.0) -> CommandOutput: ...
+
+    def run_cancellable(
+        self,
+        arguments: list[str],
+        *,
+        timeout: float,
+        cancelled: threading.Event,
+    ) -> CommandOutput: ...
+
+    def host_path(self, path: Path) -> str: ...
+
+    def open_stream(self, arguments: list[str], *, timeout: float = 300.0) -> ClosableByteStream: ...
+
+    def stream(self, arguments: list[str], *, timeout: float = 300.0) -> Iterator[bytes]: ...
+
+
+class ClosableByteStream(Protocol):
+    def __iter__(self) -> Iterator[bytes]: ...
+
+    def __next__(self) -> bytes: ...
+
+    def close(self) -> None: ...
+
+
+class SubprocessByteStream:
+    def __init__(self, command: GPhotoCommand, arguments: list[str], *, timeout: float) -> None:
+        self._command = command
+        self._arguments = arguments
+        self._timeout = timeout
+        self._started_at = time.monotonic()
+        self._stdout_queue: queue.Queue[bytes | object] = queue.Queue(maxsize=8)
+        self._stdout_complete = object()
+        self._stop_reading = threading.Event()
+        self._closed = threading.Event()
+        self._close_lock = threading.Lock()
+        self._stderr_parts: list[bytes] = []
+        self._stderr_size = 0
+        try:
+            self._process = subprocess.Popen(
+                [*command.prefix, *arguments],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_command_environment(),
+            )
+        except FileNotFoundError as error:
+            raise _engine_unavailable(command.display) from error
+
+        self._stdout_thread = threading.Thread(
+            target=self._drain_stdout,
+            name="gphoto2-stdout",
+            daemon=True,
+        )
+        self._stderr_thread = threading.Thread(
+            target=self._drain_stderr,
+            name="gphoto2-stderr",
+            daemon=True,
+        )
+        self._stdout_thread.start()
+        self._stderr_thread.start()
+
+    def __iter__(self) -> SubprocessByteStream:
+        return self
+
+    def __next__(self) -> bytes:
+        while not self._closed.is_set():
+            remaining = self._timeout - (time.monotonic() - self._started_at)
+            if remaining <= 0:
+                self.close()
+                raise BridgeError(
+                    "ENGINE_TIMEOUT",
+                    f"gphoto2 media transfer exceeded {self._timeout:g} seconds.",
+                    status_code=504,
+                    engine=ENGINE_NAME,
+                )
+            try:
+                chunk = self._stdout_queue.get(timeout=min(remaining, 0.25))
+            except queue.Empty:
+                continue
+            if chunk is self._stdout_complete:
+                with self._close_lock:
+                    if self._closed.is_set():
+                        raise StopIteration
+                    return_code = self._finish_process(terminate=False)
+                    self._closed.set()
+                if return_code != 0:
+                    raise _command_error(self._arguments, return_code, self._stderr_text())
+                raise StopIteration
+            assert isinstance(chunk, bytes)
+            return chunk
+        raise StopIteration
+
+    def close(self) -> None:
+        with self._close_lock:
+            if self._closed.is_set():
+                return
+            self._closed.set()
+            self._stop_reading.set()
+            self._finish_process(terminate=True)
+
+    def _drain_stdout(self) -> None:
+        assert self._process.stdout is not None
+        try:
+            while not self._stop_reading.is_set():
+                chunk = self._process.stdout.read(64 * 1024)
+                if not chunk:
+                    break
+                while not self._stop_reading.is_set():
+                    try:
+                        self._stdout_queue.put(chunk, timeout=0.1)
+                        break
+                    except queue.Full:
+                        continue
+        finally:
+            while not self._stop_reading.is_set():
+                try:
+                    self._stdout_queue.put(self._stdout_complete, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+
+    def _drain_stderr(self) -> None:
+        assert self._process.stderr is not None
+        while chunk := self._process.stderr.read(16 * 1024):
+            self._stderr_parts.append(chunk)
+            self._stderr_size += len(chunk)
+            while self._stderr_size > 256 * 1024 and len(self._stderr_parts) > 1:
+                self._stderr_size -= len(self._stderr_parts.pop(0))
+
+    def _finish_process(self, *, terminate: bool) -> int:
+        self._stop_reading.set()
+        if terminate and self._process.poll() is None:
+            self._process.terminate()
+        try:
+            return_code = self._process.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            self._process.kill()
+            return_code = self._process.wait(timeout=5.0)
+        if threading.current_thread() is not self._stdout_thread:
+            self._stdout_thread.join(timeout=1.0)
+        if threading.current_thread() is not self._stderr_thread:
+            self._stderr_thread.join(timeout=1.0)
+        return return_code
+
+    def _stderr_text(self) -> str:
+        return _decode_process_text(b"".join(self._stderr_parts))
+
+
+class SubprocessGPhotoRunner:
+    def __init__(
+        self,
+        binary: str | None = None,
+        *,
+        command: GPhotoCommand | None = None,
+        wsl_probe: Callable[[GPhotoCommand], WslHostState] | None = None,
+    ) -> None:
+        self.command = command or resolve_gphoto_command(binary)
+        self.binary = self.command.prefix[0]
+        self._wsl_probe = wsl_probe or _probe_wsl_host
+
+    def health(self) -> tuple[bool, str | None, str | None]:
+        resolved = shutil.which(self.command.prefix[0])
+        if resolved is None:
+            return False, None, f"Host executable '{self.command.prefix[0]}' was not found on PATH."
+        wsl_state: WslHostState | None = None
+        if self.command.host_mode == "wsl":
+            wsl_state = self._wsl_probe(self.command)
+            if wsl_state.error:
+                return False, None, wsl_state.error
+        try:
+            output = self.run(["--version"], timeout=5.0)
+        except BridgeError as error:
+            if self.command.host_mode == "wsl":
+                distro = self.command.wsl_distro or "the default WSL distribution"
+                return (
+                    False,
+                    None,
+                    f"gphoto2 is not runnable in {distro}. Install it there with "
+                    f"'sudo apt update && sudo apt install gphoto2 usbutils'. {error.message}",
+                )
+            return False, None, error.message
+        first_line = next((line.strip() for line in output.text.splitlines() if line.strip()), None)
+        detail = None
+        if wsl_state is not None:
+            distro = self.command.wsl_distro or wsl_state.distributions[0]
+            detail = f"Using gphoto2 in WSL distribution '{distro}'."
+            if not wsl_state.usbipd_available:
+                detail += " Install usbipd-win before attaching a Windows USB camera to WSL."
+        return True, first_line, detail
+
+    def run(self, arguments: list[str], *, timeout: float = 30.0) -> CommandOutput:
+        command = [*self.command.prefix, *arguments]
+        try:
+            completed = subprocess.run(
+                command,
+                capture_output=True,
+                check=False,
+                timeout=timeout,
+                env=_command_environment(),
+            )
+        except FileNotFoundError as error:
+            raise _engine_unavailable(self.command.display) from error
+        except subprocess.TimeoutExpired as error:
+            raise BridgeError(
+                "ENGINE_TIMEOUT",
+                f"gphoto2 did not finish within {timeout:g} seconds.",
+                status_code=504,
+                engine=ENGINE_NAME,
+            ) from error
+        if len(completed.stdout) > MAX_COMMAND_OUTPUT_BYTES:
+            raise BridgeError(
+                "ENGINE_OUTPUT_LIMIT",
+                f"gphoto2 returned more than {MAX_COMMAND_OUTPUT_BYTES} bytes of command output.",
+                status_code=502,
+                engine=ENGINE_NAME,
+            )
+        stderr = _decode_process_text(completed.stderr)
+        if completed.returncode != 0:
+            raise _command_error(arguments, completed.returncode, stderr)
+        return CommandOutput(stdout=completed.stdout, stderr=stderr)
+
+    def run_cancellable(
+        self,
+        arguments: list[str],
+        *,
+        timeout: float,
+        cancelled: threading.Event,
+    ) -> CommandOutput:
+        if cancelled.is_set():
+            raise _upload_cancelled()
+        with tempfile.TemporaryFile() as stdout_file, tempfile.TemporaryFile() as stderr_file:
+            try:
+                process = subprocess.Popen(
+                    [*self.command.prefix, *arguments],
+                    stdout=stdout_file,
+                    stderr=stderr_file,
+                    env=_command_environment(),
+                )
+            except FileNotFoundError as error:
+                raise _engine_unavailable(self.command.display) from error
+
+            started_at = time.monotonic()
+            while True:
+                if cancelled.is_set():
+                    _terminate_process(process)
+                    raise _upload_cancelled()
+                remaining = timeout - (time.monotonic() - started_at)
+                if remaining <= 0:
+                    _terminate_process(process)
+                    raise BridgeError(
+                        "ENGINE_TIMEOUT",
+                        f"gphoto2 did not finish within {timeout:g} seconds.",
+                        status_code=504,
+                        engine=ENGINE_NAME,
+                    )
+                try:
+                    process.wait(timeout=min(remaining, 0.1))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+
+            stdout_file.seek(0, os.SEEK_END)
+            stdout_size = stdout_file.tell()
+            if stdout_size > MAX_COMMAND_OUTPUT_BYTES:
+                raise BridgeError(
+                    "ENGINE_OUTPUT_LIMIT",
+                    f"gphoto2 returned more than {MAX_COMMAND_OUTPUT_BYTES} bytes of command output.",
+                    status_code=502,
+                    engine=ENGINE_NAME,
+                )
+            stdout_file.seek(0)
+            stdout = stdout_file.read()
+            stderr_file.seek(0, os.SEEK_END)
+            stderr_size = stderr_file.tell()
+            stderr_file.seek(max(0, stderr_size - MAX_COMMAND_STDERR_BYTES))
+            stderr = _decode_process_text(stderr_file.read())
+            if process.returncode != 0:
+                raise _command_error(arguments, process.returncode, stderr)
+            return CommandOutput(stdout=stdout, stderr=stderr)
+
+    def host_path(self, path: Path) -> str:
+        resolved = path.resolve(strict=False)
+        if self.command.host_mode != "wsl":
+            return os.fspath(resolved)
+        return _windows_path_to_wsl(os.fspath(resolved))
+
+    def open_stream(self, arguments: list[str], *, timeout: float = 300.0) -> ClosableByteStream:
+        return SubprocessByteStream(self.command, arguments, timeout=timeout)
+
+    def stream(self, arguments: list[str], *, timeout: float = 300.0) -> Iterator[bytes]:
+        stream = self.open_stream(arguments, timeout=timeout)
+
+        def iterator() -> Iterator[bytes]:
+            try:
+                yield from stream
+            finally:
+                stream.close()
+
+        return iterator()
+
+
+def _command_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment["LC_ALL"] = "C"
+    environment["LANG"] = "C"
+    return environment
+
+
+def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        process.terminate()
+    try:
+        process.wait(timeout=5.0)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5.0)
+
+
+def _upload_cancelled() -> BridgeError:
+    return BridgeError(
+        "UPLOAD_CANCELLED",
+        "The media upload was cancelled and the gphoto2 process was stopped.",
+        status_code=409,
+        feature=CameraFeature.MEDIA_UPLOAD.value,
+        engine=ENGINE_NAME,
+    )
+
+
+def _windows_path_to_wsl(value: str) -> str:
+    windows_path = PureWindowsPath(value)
+    drive = windows_path.drive
+    if len(drive) != 2 or drive[1] != ":":
+        raise BridgeError(
+            "UNSUPPORTED_CAPTURE_DIRECTORY",
+            "WSL capture storage must be on a local Windows drive.",
+            status_code=500,
+            feature=CameraFeature.STILL_CAPTURE.value,
+            engine=ENGINE_NAME,
+        )
+    relative_parts = windows_path.parts[1:]
+    suffix = "/".join(relative_parts)
+    return f"/mnt/{drive[0].lower()}/{suffix}" if suffix else f"/mnt/{drive[0].lower()}"
+
+
+def _decode_process_text(value: bytes) -> str:
+    if not value:
+        return ""
+    if value.startswith((b"\xff\xfe", b"\xfe\xff")) or value.count(b"\x00") > len(value) // 8:
+        try:
+            encoding = "utf-16" if value.startswith((b"\xff\xfe", b"\xfe\xff")) else "utf-16-le"
+            return value.decode(encoding, errors="replace").replace("\ufeff", "")
+        except UnicodeError:
+            pass
+    return value.decode("utf-8", errors="replace")
+
+
+def _probe_wsl_host(command: GPhotoCommand) -> WslHostState:
+    wsl = command.prefix[0]
+    try:
+        completed = subprocess.run(
+            [wsl, "--list", "--quiet"],
+            capture_output=True,
+            check=False,
+            timeout=5.0,
+            env=_command_environment(),
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return WslHostState(error="WSL is installed but its distribution list could not be read.")
+    output = _decode_process_text(completed.stdout)
+    distributions = tuple(line.strip().strip("\x00") for line in output.splitlines() if line.strip().strip("\x00"))
+    if completed.returncode != 0 or not distributions:
+        return WslHostState(
+            error=(
+                "Native gphoto2 was not found and WSL has no Linux distribution. "
+                "Install one with 'wsl --install -d Ubuntu' before using PC USB control."
+            )
+        )
+    if command.wsl_distro and command.wsl_distro.casefold() not in {
+        distribution.casefold() for distribution in distributions
+    }:
+        return WslHostState(
+            distributions=distributions,
+            error=(
+                f"Configured WSL distribution '{command.wsl_distro}' was not found. "
+                f"Available: {', '.join(distributions)}."
+            ),
+        )
+    return WslHostState(
+        distributions=distributions,
+        usbipd_available=shutil.which("usbipd.exe") is not None,
+    )
+
+
+def _engine_unavailable(executable: str) -> BridgeError:
+    return BridgeError(
+        "ENGINE_UNAVAILABLE",
+        f"Host command '{executable}' is not installed or is not on PATH.",
+        status_code=503,
+        engine=ENGINE_NAME,
+    )
+
+
+def _command_error(arguments: list[str], return_code: int, stderr: str) -> BridgeError:
+    useful_lines = [
+        line.strip()
+        for line in stderr.splitlines()
+        if line.strip() and "For debugging messages" not in line and "Please make sure" not in line
+    ]
+    detail = " ".join(useful_lines[-8:])[-2000:] or f"gphoto2 exited with code {return_code}."
+    operation = next((item for item in reversed(arguments) if item.startswith("--")), "command")
+    return BridgeError(
+        "ENGINE_COMMAND_FAILED",
+        f"gphoto2 {operation} failed: {detail}",
+        status_code=502,
+        engine=ENGINE_NAME,
+    )
+
+
+class MjpegFrameParser:
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+
+    def feed(self, chunk: bytes) -> list[bytes]:
+        if chunk:
+            self._buffer.extend(chunk)
+        frames: list[bytes] = []
+        while True:
+            start = self._buffer.find(b"\xff\xd8")
+            if start < 0:
+                if len(self._buffer) > MAX_LIVE_VIEW_BUFFER_BYTES:
+                    del self._buffer[:-1]
+                return frames
+            if start:
+                del self._buffer[:start]
+            end = self._buffer.find(b"\xff\xd9", 2)
+            if end < 0:
+                if len(self._buffer) > MAX_LIVE_VIEW_FRAME_BYTES:
+                    raise BridgeError(
+                        "LIVE_VIEW_FRAME_LIMIT",
+                        f"gphoto2 returned a Live View frame larger than {MAX_LIVE_VIEW_FRAME_BYTES} bytes.",
+                        status_code=502,
+                        feature=CameraFeature.LIVE_VIEW.value,
+                        engine=ENGINE_NAME,
+                    )
+                return frames
+            end += 2
+            frames.append(bytes(self._buffer[:end]))
+            del self._buffer[:end]
+
+
+class GPhotoMjpegSession:
+    def __init__(self, source: ClosableByteStream, *, target_fps: int) -> None:
+        self._source = source
+        self._target_fps = max(1, min(target_fps, MAX_BRIDGE_LIVE_VIEW_FPS))
+        self._condition = threading.Condition()
+        self._closed = False
+        self._latest_frame: bytes | None = None
+        self._frame_generation = 0
+        self._delivered_generation = 0
+        self._last_published_at = 0.0
+        self._error: BridgeError | None = None
+        self._thread = threading.Thread(target=self._pump, name="gphoto2-mjpeg", daemon=True)
+
+    def start(self, timeout: float = LIVE_VIEW_FIRST_FRAME_TIMEOUT_SECONDS) -> None:
+        self._thread.start()
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while not self._closed and self._frame_generation == 0 and self._error is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._condition.wait(remaining)
+            if self._frame_generation > 0:
+                return
+            error = self._error or BridgeError(
+                "LIVE_VIEW_FIRST_FRAME_TIMEOUT",
+                f"gphoto2 capture-movie did not produce a JPEG frame within {timeout:g} seconds.",
+                status_code=504,
+                feature=CameraFeature.LIVE_VIEW.value,
+                engine=ENGINE_NAME,
+            )
+        self.close()
+        raise error
+
+    def read_frame(self, timeout: float = LIVE_VIEW_FRAME_TIMEOUT_SECONDS) -> bytes:
+        deadline = time.monotonic() + timeout
+        with self._condition:
+            while not self._closed and self._frame_generation <= self._delivered_generation and self._error is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._condition.wait(remaining)
+            if self._latest_frame is not None and self._frame_generation > self._delivered_generation:
+                self._delivered_generation = self._frame_generation
+                return self._latest_frame
+            if self._error is not None:
+                raise self._error
+            raise BridgeError(
+                "LIVE_VIEW_FRAME_TIMEOUT",
+                f"gphoto2 capture-movie did not produce another JPEG frame within {timeout:g} seconds.",
+                status_code=504,
+                feature=CameraFeature.LIVE_VIEW.value,
+                engine=ENGINE_NAME,
+            )
+
+    def close(self) -> None:
+        with self._condition:
+            if self._closed:
+                return
+            self._closed = True
+            self._condition.notify_all()
+        self._source.close()
+        if threading.current_thread() is not self._thread:
+            self._thread.join(timeout=3.0)
+
+    def _pump(self) -> None:
+        parser = MjpegFrameParser()
+        try:
+            for chunk in self._source:
+                for frame in parser.feed(chunk):
+                    now = time.monotonic()
+                    if self._last_published_at and now - self._last_published_at < 1 / self._target_fps:
+                        continue
+                    with self._condition:
+                        if self._closed:
+                            return
+                        self._latest_frame = frame
+                        self._frame_generation += 1
+                        self._last_published_at = now
+                        self._condition.notify_all()
+            with self._condition:
+                if not self._closed:
+                    self._error = BridgeError(
+                        "LIVE_VIEW_STREAM_ENDED",
+                        "gphoto2 capture-movie ended before Live View was stopped.",
+                        status_code=502,
+                        feature=CameraFeature.LIVE_VIEW.value,
+                        engine=ENGINE_NAME,
+                    )
+                    self._condition.notify_all()
+        except BridgeError as error:
+            with self._condition:
+                if not self._closed:
+                    self._error = error
+                    self._condition.notify_all()
+        except Exception as error:
+            with self._condition:
+                if not self._closed:
+                    self._error = BridgeError(
+                        "LIVE_VIEW_STREAM_FAILED",
+                        f"gphoto2 capture-movie failed: {type(error).__name__}: {error}",
+                        status_code=502,
+                        feature=CameraFeature.LIVE_VIEW.value,
+                        engine=ENGINE_NAME,
+                    )
+                    self._condition.notify_all()
+        finally:
+            self._source.close()
+
+
+@dataclass
+class GPhotoConfig:
+    path: str
+    label: str = ""
+    readonly: bool = True
+    kind: str = "TEXT"
+    current: str = ""
+    choices: list[str] = field(default_factory=list)
+    bottom: float | None = None
+    top: float | None = None
+    step: float | None = None
+
+    def selectable_values(self) -> list[str]:
+        if self.kind in {"RADIO", "MENU"}:
+            return list(dict.fromkeys(self.choices))
+        if self.kind == "RANGE" and self.bottom is not None and self.top is not None and self.step:
+            span = self.top - self.bottom
+            if span < 0 or self.step <= 0:
+                return []
+            intervals = round(span / self.step)
+            if intervals > 255:
+                return []
+            return [_format_number(self.bottom + self.step * index) for index in range(intervals + 1)]
+        return []
+
+
+def _config_epoch_seconds(config: GPhotoConfig | None) -> int | None:
+    if config is None or config.kind != "DATE":
+        return None
+    try:
+        value = int(config.current, 10)
+    except ValueError:
+        return None
+    return value if 0 <= value <= 0xFFFF_FFFF else None
+
+
+@dataclass(frozen=True)
+class GPhotoAbilities:
+    model: str = ""
+    capture_image: bool = False
+    capture_preview: bool = False
+    trigger_capture: bool = False
+    configuration: bool = False
+    delete_files: bool = False
+    file_preview: bool = False
+
+
+@dataclass(frozen=True)
+class GPhotoMediaInfo:
+    file_section_available: bool = False
+    content_type: str | None = None
+    size_bytes: int | None = None
+    width_pixels: int | None = None
+    height_pixels: int | None = None
+    capture_time: str | None = None
+
+
+@dataclass(frozen=True)
+class StorageDevice:
+    storage_id: str | None
+    label: str
+    description: str
+    base_dir: str
+    writable: bool | None
+    total_bytes: int | None
+    free_bytes: int | None
+    free_images: int | None
+
+
+@dataclass(frozen=True)
+class StorageSnapshot:
+    available: bool | None
+    total_bytes: int | None
+    free_bytes: int | None
+    free_images: int | None
+    devices: int
+    entries: tuple[StorageDevice, ...] = ()
+
+
+@dataclass(frozen=True)
+class ConfigSpec:
+    key: str
+    label: str
+    suffixes: tuple[str, ...]
+    core: bool = False
+
+
+@dataclass(frozen=True)
+class TextMetadataSpec:
+    key: str
+    label: str
+    suffix: str
+
+
+CONFIG_SPECS = (
+    ConfigSpec("iso", "ISO", ("iso",), core=True),
+    ConfigSpec("shutter", "Shutter speed", ("shutterspeed", "exposuretime"), core=True),
+    ConfigSpec("aperture", "Aperture", ("aperture", "f-number"), core=True),
+    ConfigSpec("whitebalance", "White balance", ("whitebalance",), core=True),
+    ConfigSpec("exposurecompensation", "Exposure compensation", ("exposurecompensation",)),
+    ConfigSpec("afoperation", "Focus mode", ("focusmode",)),
+    ConfigSpec("afmethod", "AF method", ("afmethod",)),
+    ConfigSpec("drivemode", "Drive mode", ("drivemode",)),
+    ConfigSpec("meteringmode", "Metering mode", ("meteringmode",)),
+    ConfigSpec("picturestyle", "Picture style", ("picturestyle",)),
+    ConfigSpec("stillimagequality", "Image quality", ("imageformat", "imagequality")),
+    ConfigSpec("stillimagequalitysd", "SD image quality", ("imageformatsd",)),
+    ConfigSpec("stillimagequalitycf", "CF/CFexpress image quality", ("imageformatcf",)),
+    ConfigSpec("shootingmode", "Shooting mode", ("autoexposuremode",)),
+    ConfigSpec("colortemperature", "Color temperature", ("colortemperature",)),
+    ConfigSpec("whitebalanceadjusta", "White balance shift A", ("whitebalanceadjusta",)),
+    ConfigSpec("whitebalanceadjustb", "White balance shift B", ("whitebalanceadjustb",)),
+    ConfigSpec("colorspace", "Color space", ("colorspace",)),
+    ConfigSpec("aspectratio", "Aspect ratio", ("aspectratio",)),
+    ConfigSpec("zoomspeed", "Power zoom speed", ("zoomspeed",)),
+    ConfigSpec("autopoweroff", "Auto power off", ("autopoweroff",)),
+    ConfigSpec("highisonr", "High ISO noise reduction", ("highisonr",)),
+    ConfigSpec("alomode", "Auto Lighting Optimizer", ("alomode",)),
+    ConfigSpec("continuousaf", "Continuous AF", ("continuousaf",)),
+    ConfigSpec("movieservoaf", "Movie Servo AF", ("movieservoaf",)),
+    ConfigSpec("aeb", "Auto exposure bracketing", ("aeb",)),
+    ConfigSpec("capturetarget", "Capture target", ("capturetarget",)),
+    ConfigSpec("capturestorage", "Recording card", ("storageid",)),
+)
+
+TEXT_METADATA_SPECS = (
+    TextMetadataSpec("ownername", "Owner name", "ownername"),
+    TextMetadataSpec("artist", "Artist", "artist"),
+    TextMetadataSpec("copyright", "Copyright", "copyright"),
+    TextMetadataSpec("nickname", "Nickname", "nickname"),
+)
+
+
+def parse_auto_detect(output: str) -> list[CameraDescriptor]:
+    cameras: list[CameraDescriptor] = []
+    pattern = re.compile(r"^(?P<model>.+?)\s{2,}(?P<port>(?:usb|ptpip|serial|disk|usbscsi):.*)$", re.I)
+    for line in output.splitlines():
+        match = pattern.match(line.rstrip())
+        if not match:
+            continue
+        model = match.group("model").strip()
+        port = match.group("port").strip()
+        cameras.append(CameraDescriptor(id=_camera_id(port), model=model, port=port))
+    return cameras
+
+
+def parse_summary(output: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    aliases = {
+        "manufacturer": "manufacturer",
+        "model": "model",
+        "serial number": "serial",
+        "version": "device_version",
+        "device version": "device_version",
+    }
+    for line in output.splitlines():
+        if ":" not in line:
+            continue
+        key, value = (part.strip() for part in line.split(":", 1))
+        normalized = key.lower()
+        target = aliases.get(normalized)
+        if target and value and value != "(null)":
+            result[target] = value
+    return result
+
+
+def summary_supports_file_upload(output: str) -> bool:
+    return any(
+        re.search(r"\bFile\s+Upload\b", line, re.I)
+        and re.search(r"\bNo\s+File\s+Upload\b", line, re.I) is None
+        for line in output.splitlines()
+    )
+
+
+def parse_abilities(output: str) -> GPhotoAbilities:
+    model_match = re.search(r"^Abilities for camera\s*:\s*(.+)$", output, re.M | re.I)
+    capture_lines = {
+        match.group(1).strip().lower()
+        for match in re.finditer(r"^\s*:\s*(Image|Preview|Trigger Capture)\s*$", output, re.M | re.I)
+    }
+    configuration_match = re.search(r"^Configuration support\s*:\s*(yes|no)\s*$", output, re.M | re.I)
+    delete_match = re.search(r"^Delete selected files on camera\s*:\s*(yes|no)\s*$", output, re.M | re.I)
+    file_preview_match = re.search(
+        r"^File preview(?:\s*\(thumbnail\))? support\s*:\s*(yes|no)\s*$",
+        output,
+        re.M | re.I,
+    )
+    return GPhotoAbilities(
+        model=model_match.group(1).strip() if model_match else "",
+        capture_image="image" in capture_lines,
+        capture_preview="preview" in capture_lines,
+        trigger_capture="trigger capture" in capture_lines,
+        configuration=bool(configuration_match and configuration_match.group(1).lower() == "yes"),
+        delete_files=bool(delete_match and delete_match.group(1).lower() == "yes"),
+        file_preview=bool(file_preview_match and file_preview_match.group(1).lower() == "yes"),
+    )
+
+
+def parse_config_dump(output: str) -> dict[str, GPhotoConfig]:
+    configs: dict[str, GPhotoConfig] = {}
+    current: GPhotoConfig | None = None
+    for raw_line in output.splitlines():
+        line = raw_line.rstrip("\r")
+        if line.startswith("/"):
+            if current is not None:
+                configs[current.path] = current
+            current = GPhotoConfig(path=line.strip())
+            continue
+        if current is None:
+            continue
+        if line == "END":
+            configs[current.path] = current
+            current = None
+            continue
+        if line.startswith("Choice:"):
+            choice_match = re.match(r"Choice:\s+\d+\s?(.*)$", line)
+            if choice_match:
+                current.choices.append(choice_match.group(1))
+            continue
+        if ":" not in line:
+            continue
+        key, raw_value = line.split(":", 1)
+        key = key.strip()
+        value = raw_value.strip()
+        if key == "Label":
+            current.label = value
+        elif key == "Readonly":
+            current.readonly = value not in {"0", "false", "False"}
+        elif key == "Type":
+            current.kind = value.upper()
+        elif key == "Current":
+            current.current = raw_value[1:] if raw_value.startswith(" ") else raw_value
+        elif key == "Bottom":
+            current.bottom = _parse_float(value)
+        elif key == "Top":
+            current.top = _parse_float(value)
+        elif key == "Step":
+            current.step = _parse_float(value)
+    if current is not None:
+        configs[current.path] = current
+    return configs
+
+
+def parse_storage_info(output: str) -> StorageSnapshot:
+    entries: list[StorageDevice] = []
+    current: dict[str, object] | None = None
+
+    def finish_current() -> None:
+        nonlocal current
+        if current is None:
+            return
+        base_dir = str(current.get("base_dir", ""))
+        storage_id = current.get("storage_id")
+        if storage_id is None:
+            match = re.search(r"(?:^|/)store_([0-9a-f]{8})(?:/|$)", base_dir, re.I)
+            storage_id = match.group(1).upper() if match else None
+        entries.append(
+            StorageDevice(
+                storage_id=str(storage_id) if storage_id is not None else None,
+                label=str(current.get("label", "")),
+                description=str(current.get("description", "")),
+                base_dir=base_dir,
+                writable=current.get("writable") if isinstance(current.get("writable"), bool) else None,
+                total_bytes=current.get("total_bytes") if isinstance(current.get("total_bytes"), int) else None,
+                free_bytes=current.get("free_bytes") if isinstance(current.get("free_bytes"), int) else None,
+                free_images=current.get("free_images") if isinstance(current.get("free_images"), int) else None,
+            )
+        )
+        current = None
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        official_header = re.fullmatch(r"\[Storage\s+\d+\]", line, re.I)
+        numbered_header = re.fullmatch(r"Storage\s+#\d+:", line, re.I)
+        summary_header = re.fullmatch(r"store_([0-9a-f]{8}):", line, re.I)
+        if official_header or numbered_header or summary_header:
+            finish_current()
+            current = {}
+            if summary_header:
+                current["storage_id"] = summary_header.group(1).upper()
+                current["base_dir"] = f"/store_{summary_header.group(1).lower()}"
+            continue
+        if current is None:
+            continue
+
+        equals_index = line.find("=")
+        colon_index = line.find(":")
+        uses_key_value_format = equals_index >= 0 and (colon_index < 0 or equals_index < colon_index)
+        key, separator, raw_value = line.partition("=" if uses_key_value_format else ":")
+        if not separator:
+            continue
+        normalized_key = re.sub(r"\s+", "", key).casefold()
+        value = raw_value.strip()
+        if normalized_key in {"label", "volumelabel"}:
+            current["label"] = value
+        elif normalized_key in {"description", "storagedescription"}:
+            current["description"] = value
+        elif normalized_key == "basedir":
+            current["base_dir"] = value
+        elif normalized_key in {"access", "accesscapability"}:
+            access_code = re.match(r"(\d+)", value)
+            if access_code:
+                current["writable"] = access_code.group(1) == "0"
+            elif value.casefold() == "read-write":
+                current["writable"] = True
+            elif value:
+                current["writable"] = False
+        elif normalized_key in {"totalcapacity", "capacity", "maximumcapacity", "maximumcapability"}:
+            parsed = _storage_size_bytes(value, default_unit="KB" if uses_key_value_format else "B")
+            if parsed is not None:
+                current["total_bytes"] = parsed
+        elif normalized_key in {"free", "freespace(bytes)"}:
+            parsed = _storage_size_bytes(value, default_unit="KB" if uses_key_value_format else "B")
+            if parsed is not None:
+                current["free_bytes"] = parsed
+        elif normalized_key in {"freeimages", "freespace(images)"}:
+            parsed = _leading_int(value)
+            if parsed is not None and parsed >= 0:
+                current["free_images"] = parsed
+    finish_current()
+
+    capacities = [entry.total_bytes for entry in entries if entry.total_bytes is not None]
+    free_bytes = [entry.free_bytes for entry in entries if entry.free_bytes is not None]
+    free_images = [entry.free_images for entry in entries if entry.free_images is not None]
+    devices = len(entries)
+    return StorageSnapshot(
+        available=devices > 0 if output.strip() else None,
+        total_bytes=sum(capacities) if capacities else None,
+        free_bytes=sum(free_bytes) if free_bytes else None,
+        free_images=sum(free_images) if free_images else None,
+        devices=devices,
+        entries=tuple(entries),
+    )
+
+
+def parse_media_list(output: str) -> list[MediaItem]:
+    current_folder = "/"
+    items: list[MediaItem] = []
+    folder_pattern = re.compile(r"There (?:is|are) \d+ files? in folder '([^']+)'", re.I)
+    file_pattern = re.compile(
+        r"^#(?P<number>\d+)\s+(?P<name>.+?)\s+"
+        r"(?:(?P<access>[a-z-]{2})\s+)?(?P<size>\d+)\s+(?P<unit>[KMGT]?B)"
+        r"(?:\s+(?P<width>\d+)x(?P<height>\d+))?\s+"
+        r"(?P<mime>\S+)(?:\s+(?P<timestamp>\d{9,}))?\s*$",
+        re.I,
+    )
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        folder_match = folder_pattern.search(line)
+        if folder_match:
+            current_folder = folder_match.group(1)
+            continue
+        file_match = file_pattern.match(line)
+        if not file_match:
+            continue
+        name = file_match.group("name").strip()
+        content_type = file_match.group("mime")
+        size = int(file_match.group("size")) * _size_multiplier(file_match.group("unit"))
+        width_pixels = int(file_match.group("width")) if file_match.group("width") else None
+        height_pixels = int(file_match.group("height")) if file_match.group("height") else None
+        width_pixels = width_pixels if width_pixels and width_pixels > 0 else None
+        height_pixels = height_pixels if height_pixels and height_pixels > 0 else None
+        timestamp = file_match.group("timestamp")
+        capture_time = None
+        if timestamp:
+            capture_time = datetime.fromtimestamp(int(timestamp), UTC).isoformat().replace("+00:00", "Z")
+        items.append(
+            MediaItem(
+                id=_media_id(current_folder, name),
+                name=name,
+                kind=_media_kind(name, content_type),
+                size_bytes=size,
+                capture_time=capture_time,
+                content_type=content_type,
+                width_pixels=width_pixels,
+                height_pixels=height_pixels,
+                preview_available=is_previewable_media(name, content_type, size),
+            )
+        )
+    return list(reversed(items))
+
+
+def parse_media_info(output: str) -> GPhotoMediaInfo:
+    in_file_section = False
+    file_section_available = False
+    content_type: str | None = None
+    size_bytes: int | None = None
+    width_pixels: int | None = None
+    height_pixels: int | None = None
+    capture_time: str | None = None
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line == "File:":
+            in_file_section = True
+            file_section_available = True
+            continue
+        if line in {"Thumbnail:", "Audio data:"}:
+            in_file_section = False
+            continue
+        if not in_file_section or ":" not in line:
+            continue
+
+        key, value = (part.strip() for part in line.split(":", 1))
+        if key == "Mime type":
+            match = re.fullmatch(r"'([^'\s/]+/[^'\s/]+)'", value)
+            if match and len(match.group(1)) <= 127:
+                content_type = match.group(1)
+        elif key == "Size":
+            match = re.fullmatch(r"(\d+)\s+byte\(s\)", value)
+            if match:
+                size_bytes = int(match.group(1))
+        elif key == "Width":
+            match = re.fullmatch(r"([1-9]\d*)\s+pixel\(s\)", value)
+            if match:
+                width_pixels = int(match.group(1))
+        elif key == "Height":
+            match = re.fullmatch(r"([1-9]\d*)\s+pixel\(s\)", value)
+            if match:
+                height_pixels = int(match.group(1))
+        elif key == "Time":
+            capture_time = _parse_gphoto_local_time(value)
+
+    return GPhotoMediaInfo(
+        file_section_available=file_section_available,
+        content_type=content_type,
+        size_bytes=size_bytes,
+        width_pixels=width_pixels,
+        height_pixels=height_pixels,
+        capture_time=capture_time,
+    )
+
+
+def parse_wait_event_keys(output: str) -> list[str]:
+    changed: set[str] = set()
+    for raw_line in output.splitlines():
+        line = raw_line.strip().upper()
+        if line == "CAPTURECOMPLETE":
+            changed.update(("shooting", "contents", "storage"))
+        elif line.startswith(("FILEADDED ", "FOLDERADDED ", "FILECHANGED ")):
+            changed.update(("contents", "storage"))
+        elif line == "UNKNOWN" or line.startswith("UNKNOWN "):
+            changed.add("shooting")
+    return [key for key in ("shooting", "contents", "storage") if key in changed]
+
+
+class GPhoto2Engine:
+    name = ENGINE_NAME
+
+    def __init__(
+        self,
+        runner: GPhotoRunner | None = None,
+        *,
+        capture_directory: Path | None = None,
+        environment: Mapping[str, str] | None = None,
+    ) -> None:
+        self.runner = runner or SubprocessGPhotoRunner()
+        self.capture_store = LocalCaptureStore(capture_directory or default_capture_directory(environment=environment))
+
+    def health(self) -> tuple[bool, str | None, str | None]:
+        return self.runner.health()
+
+    def discover(self) -> list[CameraDescriptor]:
+        available, _, detail = self.health()
+        if not available:
+            raise BridgeError(
+                "ENGINE_UNAVAILABLE", detail or "gphoto2 is unavailable.", status_code=503, engine=self.name
+            )
+        return parse_auto_detect(self.runner.run(["--auto-detect"], timeout=15.0).text)
+
+    def open(self, camera_id: str | None = None, profile_hint: str | None = None) -> GPhoto2Session:
+        cameras = self.discover()
+        if camera_id:
+            cameras = [camera for camera in cameras if camera.id == camera_id or camera.port == camera_id]
+        elif profile_hint:
+            normalized_hint = profile_hint.casefold()
+            preferred = [camera for camera in cameras if normalized_hint in camera.model.casefold()]
+            if preferred:
+                cameras = preferred
+        if not cameras:
+            raise BridgeError(
+                "CAMERA_NOT_FOUND",
+                "No matching camera was detected by gphoto2.",
+                status_code=404,
+                engine=self.name,
+            )
+        if len(cameras) > 1:
+            raise BridgeError(
+                "CAMERA_SELECTION_REQUIRED",
+                "More than one camera is available; provide cameraId from GET /v1/cameras.",
+                status_code=409,
+                engine=self.name,
+            )
+        _, version, _ = self.health()
+        return GPhoto2Session(
+            self.runner,
+            cameras[0],
+            engine_version=version,
+            capture_store=self.capture_store,
+        )
+
+
+class GPhoto2Session:
+    engine_name = ENGINE_NAME
+
+    def __init__(
+        self,
+        runner: GPhotoRunner,
+        camera: CameraDescriptor,
+        *,
+        engine_version: str | None = None,
+        sleeper: Callable[[float], None] = time.sleep,
+        capture_store: LocalCaptureStore | None = None,
+    ) -> None:
+        self.runner = runner
+        self.camera = camera
+        self.engine_version = engine_version
+        self._sleep = sleeper
+        self._capture_store = capture_store or LocalCaptureStore(default_capture_directory())
+        self._lock = threading.RLock()
+        self._event_lock = threading.Lock()
+        self._event_state_lock = threading.Lock()
+        self._event_generation = 0
+        self._closed = False
+        self._live_view_active = False
+        self._cached_live_view_frame: bytes | None = None
+        self._live_view_stream: GPhotoMjpegSession | None = None
+        self._live_view_transport: str | None = None
+        self._live_view_fallback_reason: str | None = None
+        self._live_view_magnification: int | None = None
+        self._bulb_exposure_active = False
+        self._requested_fps = 1
+        self._last_error: str | None = None
+        self._summary_text = ""
+        self._summary_supports_file_upload = False
+        self._configs: dict[str, GPhotoConfig] = {}
+        self._last_config_refresh = 0.0
+        self._storage = StorageSnapshot(None, None, None, None, 0)
+        self._last_storage_refresh = 0.0
+        self._storage_label_by_id: dict[str, str] = {}
+        self._advertised_storage_targets: dict[str, str] = {}
+        self._camera_media_supported = False
+        self._media_cache: dict[str, MediaItem] = {}
+        self._observed: set[CameraFeature] = {CameraFeature.DESKTOP_BRIDGE}
+        self._event_polling_supported = False
+        self._event_polling_reason: str | None = None
+        self._pending_event_keys: list[str] = []
+
+        with self._lock:
+            self._summary_text = self._optional_text(["--summary"], timeout=20.0)
+            self._summary_supports_file_upload = summary_supports_file_upload(self._summary_text)
+            abilities_output = self._run(["--abilities"], timeout=20.0).text
+            self._abilities = parse_abilities(abilities_output)
+            self._refresh_configs(force=True)
+            self._refresh_storage()
+            self._camera_media_supported = self._probe(["--folder", "/", "--no-recurse", "--list-files"])
+            self._probe_event_polling()
+
+    def close(self) -> None:
+        self.stop_event_polling()
+        with self._lock:
+            if self._closed:
+                return
+            if self._bulb_exposure_active:
+                bulb_values = self._bulb_values()
+                if bulb_values is not None:
+                    try:
+                        config, _, release_value = bulb_values
+                        self._set_config_value(config, release_value, refresh=False)
+                        self._bulb_exposure_active = False
+                    except BridgeError as error:
+                        self._last_error = error.message
+            was_live_view_active = self._live_view_active
+            self._live_view_active = False
+            self._stop_movie_stream()
+            if was_live_view_active:
+                try:
+                    self._set_viewfinder(False)
+                except BridgeError as error:
+                    self._last_error = error.message
+            self._cached_live_view_frame = None
+            self._live_view_transport = None
+            self._closed = True
+
+    def info(self) -> CameraInfo:
+        with self._lock:
+            self._require_open()
+            self._observed.add(CameraFeature.CAMERA_IDENTITY)
+            summary = parse_summary(self._summary_text)
+            model = self._config_value("cameramodel") or summary.get("model") or self.camera.model
+            serial = (
+                self._config_value("eosserialnumber")
+                or self._config_value("serialnumber")
+                or summary.get("serial")
+                or "unknown"
+            )
+            return CameraInfo(
+                model=model,
+                serial=serial,
+                api="desktop-bridge/v1/libgphoto2",
+                manufacturer=self._config_value("manufacturer") or summary.get("manufacturer"),
+                device_version=self._config_value("deviceversion") or summary.get("device_version"),
+                engine_version=self.engine_version,
+            )
+
+    def status(self) -> CameraStatus:
+        with self._lock:
+            self._require_open()
+            self._refresh_configs(force=True)
+            self._refresh_storage()
+            battery_text = self._config_value("batterylevel")
+            battery_level = _battery_level(battery_text)
+            storage = self._storage
+            available_shots = _parse_available_shots(self._config_value("availableshots"))
+            free_images = available_shots if available_shots is not None else storage.free_images
+            recording_config = self._recording_config()
+            if self._find_config(("batterylevel",)):
+                self._observed.add(CameraFeature.BATTERY_STATUS)
+            if storage.available is not None:
+                self._observed.add(CameraFeature.STORAGE_STATUS)
+            return CameraStatus(
+                battery=BatteryStatus(
+                    level=battery_level,
+                    status=_battery_status(battery_level, battery_text),
+                ),
+                recording=(recording_config.current.casefold() == "card") if recording_config else None,
+                bulb_exposure_active=self._bulb_exposure_active,
+                mode=self._config_value("autoexposuremode") or "unknown",
+                media=StorageStatus(
+                    available=storage.available,
+                    total_bytes=storage.total_bytes,
+                    free_bytes=storage.free_bytes,
+                    free_images=free_images,
+                    devices=storage.devices,
+                ),
+                exposure=ExposureState(
+                    iso=self._setting_value("iso"),
+                    shutter=self._setting_value("shutter"),
+                    aperture=self._setting_value("aperture"),
+                    white_balance=self._setting_value("whitebalance"),
+                ),
+                raw={
+                    "engine": self.engine_name,
+                    "engineVersion": self.engine_version,
+                    "port": self.camera.port,
+                    "configCount": len(self._configs),
+                    "lastError": self._last_error,
+                    "liveViewTransport": self._live_view_transport,
+                    "liveViewFallbackReason": self._live_view_fallback_reason,
+                    "remainingShotsSource": (
+                        "gphoto2-config:/main/status/availableshots"
+                        if available_shots is not None
+                        else "gphoto2-storage-info"
+                        if storage.free_images is not None
+                        else None
+                    ),
+                    "eventPollingTransport": (
+                        "GPHOTO2_WAIT_EVENT" if self._event_polling_supported else None
+                    ),
+                    "eventPollingPaused": self._live_view_active or self._bulb_exposure_active,
+                },
+            )
+
+    def capabilities(self) -> CameraCapabilities:
+        with self._lock:
+            self._require_open()
+            self._refresh_configs(force=False)
+            self._refresh_storage(force=False)
+            settings = self._camera_settings()
+            settings_by_key = {setting.key: setting for setting in settings}
+            host_media_supported = self._host_capture_supported() or bool(self._capture_store.list_items())
+            media_supported = self._camera_media_supported or host_media_supported
+            supported = {CameraFeature.DESKTOP_BRIDGE, CameraFeature.CAMERA_IDENTITY}
+            if self._find_config(("batterylevel",)):
+                supported.add(CameraFeature.BATTERY_STATUS)
+            if self._storage.available is not None:
+                supported.add(CameraFeature.STORAGE_STATUS)
+            if self._still_capture_supported():
+                supported.add(CameraFeature.STILL_CAPTURE)
+            if self._abilities.capture_preview:
+                supported.update({CameraFeature.LIVE_VIEW, CameraFeature.LIVE_VIEW_JPEG_POLLING})
+            if media_supported:
+                supported.update(
+                    {
+                        CameraFeature.MEDIA_BROWSER,
+                        CameraFeature.MEDIA_PREVIEW,
+                        CameraFeature.MEDIA_DOWNLOAD,
+                    }
+                )
+                if self._abilities.file_preview or host_media_supported:
+                    supported.add(CameraFeature.MEDIA_THUMBNAIL)
+                if self._abilities.delete_files or host_media_supported:
+                    supported.add(CameraFeature.MEDIA_DELETE)
+            if self._media_upload_supported():
+                supported.add(CameraFeature.MEDIA_UPLOAD)
+            if any(key in settings_by_key for key in ("iso", "shutter", "aperture")):
+                supported.add(CameraFeature.EXPOSURE_CONTROL)
+            if "whitebalance" in settings_by_key:
+                supported.add(CameraFeature.WHITE_BALANCE_CONTROL)
+            if any(not spec.core and spec.key in settings_by_key for spec in CONFIG_SPECS) or any(
+                setting.input_kind == "text" for setting in settings
+            ):
+                supported.add(CameraFeature.ADVANCED_SETTINGS)
+            half_press_values = self._half_press_values()
+            autofocus_configs = self._autofocus_configs()
+            if half_press_values is not None:
+                supported.add(CameraFeature.SHUTTER_HALF_PRESS)
+            if self._bulb_values() is not None:
+                supported.add(CameraFeature.BULB_EXPOSURE)
+            if autofocus_configs is not None or half_press_values is not None:
+                supported.add(CameraFeature.AUTOFOCUS)
+            if self._recording_values() is not None:
+                supported.add(CameraFeature.VIDEO_RECORDING)
+            if self._focus_drive_config() is not None:
+                supported.add(CameraFeature.FOCUS_DRIVE)
+            if self._abilities.capture_preview and self._live_view_magnification_config() is not None:
+                supported.add(CameraFeature.LIVE_VIEW_MAGNIFICATION)
+            if self._event_polling_supported:
+                supported.add(CameraFeature.EVENT_POLLING)
+            if self._camera_clock_control() is not None:
+                supported.add(CameraFeature.CAMERA_CLOCK_SYNC)
+
+            planned = {
+                feature
+                for feature in (
+                    CameraFeature.EVENT_POLLING,
+                    CameraFeature.TAP_FOCUS,
+                    CameraFeature.CLICK_WHITE_BALANCE,
+                    CameraFeature.LIVE_VIEW_RTP,
+                    CameraFeature.LIVE_VIEW_MAGNIFICATION,
+                    CameraFeature.CAMERA_CLOCK_SYNC,
+                    CameraFeature.SENSOR_CLEANING,
+                    CameraFeature.CAMERA_SLEEP,
+                    CameraFeature.MEDIA_PROTECT,
+                    CameraFeature.MEDIA_RATING,
+                    CameraFeature.MEDIA_ROTATE,
+                    CameraFeature.MEDIA_ARCHIVE,
+                    CameraFeature.MEDIA_UPLOAD,
+                )
+                if feature not in supported
+            }
+            model = self.info().model
+            return CameraCapabilities(
+                profile=camera_profile(model),
+                supported=sorted(supported, key=str),
+                planned=sorted(planned, key=str),
+                reasons={
+                    **(
+                        {
+                            CameraFeature.EVENT_POLLING.value: self._event_polling_reason
+                            or "The camera rejected the bounded gphoto2 --wait-event probe."
+                        }
+                        if CameraFeature.EVENT_POLLING not in supported
+                        else {}
+                    ),
+                    CameraFeature.TAP_FOCUS.value: (
+                        "gphoto2 exposes autofocus and relative lens drive for this camera, but not a verified "
+                        "normalized image-coordinate AF point command."
+                    ),
+                    CameraFeature.MEDIA_PROTECT.value: (
+                        "No verified libgphoto2 contract for changing Canon file protection is available."
+                    ),
+                    CameraFeature.MEDIA_RATING.value: (
+                        "No verified libgphoto2 contract for changing Canon file ratings is available."
+                    ),
+                    CameraFeature.MEDIA_ROTATE.value: (
+                        "No verified libgphoto2 contract for changing Canon display rotation is available."
+                    ),
+                    CameraFeature.MEDIA_ARCHIVE.value: (
+                        "No verified libgphoto2 contract for changing Canon archive state is available."
+                    ),
+                    CameraFeature.MEDIA_UPLOAD.value: (
+                        "Requires the camera summary to advertise File Upload and a writable storage "
+                        "with a base directory."
+                    ),
+                    CameraFeature.CLICK_WHITE_BALANCE.value: (
+                        "The libgphoto2 CLI engine has no verified Live View coordinate Click WB command."
+                    ),
+                    CameraFeature.CAMERA_SLEEP.value: (
+                        "The public libgphoto2 CLI contract does not expose a verified immediate camera-sleep action."
+                    ),
+                    CameraFeature.SENSOR_CLEANING.value: (
+                        "The public libgphoto2 CLI contract does not expose a verified sensor-cleaning action."
+                    ),
+                    CameraFeature.LIVE_VIEW_MAGNIFICATION.value: (
+                        "Requires an advertised writable Canon EOS eoszoom action and active Live View."
+                    ),
+                    CameraFeature.CAMERA_CLOCK_SYNC.value: (
+                        "Requires a matching writable syncdatetimeutc/datetimeutc or "
+                        "syncdatetime/datetime action and DATE readback pair."
+                    ),
+                    CameraFeature.LIVE_VIEW.value: (
+                        "The CLI adapter uses persistent gphoto2 --capture-movie --stdout MJPEG and "
+                        "automatically falls back to bounded --capture-preview transactions when needed."
+                    ),
+                },
+                live_view=(
+                    LiveViewCapabilities(
+                        sources=["DESKTOP_BRIDGE_STREAM"],
+                        default_source="DESKTOP_BRIDGE_STREAM",
+                        sizes=["MEDIUM"],
+                        default_size="MEDIUM",
+                        magnifications=[1, 5] if self._live_view_magnification_config() is not None else [],
+                        current_magnification=(
+                            self._live_view_magnification
+                            if self._live_view_magnification in {1, 5}
+                            else None
+                        ),
+                        max_fps=MAX_BRIDGE_LIVE_VIEW_FPS,
+                    )
+                    if CameraFeature.LIVE_VIEW in supported
+                    else LiveViewCapabilities()
+                ),
+                settings=settings,
+                evidence=self._capability_evidence(),
+            )
+
+    def poll_event(self) -> CameraEvent:
+        if not self._event_polling_supported:
+            raise unsupported(CameraFeature.EVENT_POLLING.value, self.engine_name)
+        with self._event_state_lock:
+            generation = self._event_generation
+        with self._event_lock:
+            with self._event_state_lock:
+                if generation != self._event_generation:
+                    return CameraEvent()
+            paused = False
+            with self._lock:
+                self._require_open()
+                if self._pending_event_keys:
+                    changed_keys = self._pending_event_keys
+                    self._pending_event_keys = []
+                elif self._live_view_active or self._bulb_exposure_active:
+                    changed_keys = []
+                    paused = True
+                else:
+                    output = self._run(
+                        ["--wait-event", GPHOTO_EVENT_WAIT_ARGUMENT],
+                        timeout=GPHOTO_EVENT_COMMAND_TIMEOUT_SECONDS,
+                    )
+                    changed_keys = parse_wait_event_keys(output.text)
+            if paused:
+                self._sleep(GPHOTO_EVENT_IDLE_SECONDS)
+                return CameraEvent()
+            with self._event_state_lock:
+                if generation != self._event_generation:
+                    return CameraEvent()
+            with self._lock:
+                if not self._closed:
+                    self._observed.add(CameraFeature.EVENT_POLLING)
+            return CameraEvent(changed_keys=changed_keys)
+
+    def stop_event_polling(self) -> None:
+        with self._event_state_lock:
+            self._event_generation += 1
+
+    def set_setting(self, key: str, value: str) -> CameraStatus:
+        with self._lock:
+            text_spec = next((candidate for candidate in TEXT_METADATA_SPECS if candidate.key == key), None)
+            if text_spec is not None:
+                return self._set_text_metadata(text_spec, value)
+            spec = next((candidate for candidate in CONFIG_SPECS if candidate.key == key), None)
+            if spec is None:
+                raise unsupported(
+                    CameraFeature.ADVANCED_SETTINGS.value, self.engine_name, f"Unknown setting key '{key}'."
+                )
+            if key == "capturestorage":
+                return self._set_capture_storage(value)
+            config = self._find_config(spec.suffixes, writable=True)
+            if config is None:
+                feature = _feature_for_setting(key)
+                raise unsupported(feature.value, self.engine_name)
+            values = self._setting_values(spec, config)
+            selected_value = _case_insensitive_choice(values, value)
+            if selected_value is None:
+                raise BridgeError(
+                    "INVALID_SETTING_VALUE",
+                    f"Value '{value}' is not an advertised safe choice for {config.label or config.path}.",
+                    status_code=422,
+                    engine=self.engine_name,
+                )
+            self._set_config_value(config, selected_value, refresh=False)
+            self._observed.add(_feature_for_setting(key))
+            return self.status()
+
+    def _set_text_metadata(self, spec: TextMetadataSpec, value: str) -> CameraStatus:
+        config = self._find_config((spec.suffix,), writable=True)
+        if config is None or config.kind != "TEXT" or not _is_valid_text_metadata(config.current):
+            raise unsupported(
+                CameraFeature.ADVANCED_SETTINGS.value,
+                self.engine_name,
+                f"The camera did not advertise a writable, printable ASCII {spec.key} setting.",
+            )
+        if not _is_valid_text_metadata(value):
+            raise BridgeError(
+                "INVALID_SETTING_VALUE",
+                f"{spec.key} must be printable ASCII and no longer than {TEXT_METADATA_MAX_BYTES} bytes.",
+                status_code=422,
+                engine=self.engine_name,
+            )
+        path = config.path
+        self._set_config_value(config, value, refresh=False, update_current=False)
+        self._refresh_configs(force=True, strict=True)
+        readback = self._configs.get(path)
+        if readback is None:
+            raise BridgeError(
+                "SETTING_READBACK_MISSING",
+                f"The camera removed {spec.key} after the write; no same-path readback was returned.",
+                status_code=502,
+                engine=self.engine_name,
+            )
+        if readback.kind != "TEXT" or readback.current != value:
+            raise BridgeError(
+                "SETTING_READBACK_MISMATCH",
+                f"The camera read back a different {spec.key} value after writing {path}.",
+                status_code=502,
+                engine=self.engine_name,
+            )
+        self._observed.add(CameraFeature.ADVANCED_SETTINGS)
+        return self.status()
+
+    def sleep_camera(self) -> None:
+        raise unsupported(
+            CameraFeature.CAMERA_SLEEP.value,
+            self.engine_name,
+            "The public libgphoto2 CLI contract does not expose a verified immediate camera-sleep action.",
+        )
+
+    def create_directory(self, name: str) -> str:
+        del name
+        raise unsupported(
+            CameraFeature.DIRECTORY_CONTROL.value,
+            self.engine_name,
+            "The public libgphoto2 CLI contract does not expose Canon CCAPI directory creation.",
+        )
+
+    def set_file_naming(self, field: FileNamingField, value: str) -> FileNamingState:
+        del field, value
+        raise unsupported(
+            CameraFeature.FILE_NAMING_CONTROL.value,
+            self.engine_name,
+            "The public libgphoto2 CLI contract does not expose Canon CCAPI file-naming controls.",
+        )
+
+    def clean_sensor(self, auto_power_off: bool) -> None:
+        del auto_power_off
+        raise unsupported(
+            CameraFeature.SENSOR_CLEANING.value,
+            self.engine_name,
+            "The public libgphoto2 CLI contract does not expose a verified sensor-cleaning action.",
+        )
+
+    def sync_camera_clock(self) -> CameraStatus:
+        with self._lock:
+            control = self._camera_clock_control()
+            if control is None:
+                raise unsupported(
+                    CameraFeature.CAMERA_CLOCK_SYNC.value,
+                    self.engine_name,
+                    "The camera did not expose a matching writable libgphoto2 clock action and DATE readback.",
+                )
+            action, readback = control
+            requested_at = int(time.time())
+            self._set_config_value(action, "1", refresh=False)
+            self._refresh_configs(force=True, strict=True)
+            verified_at = int(time.time())
+            reported = _config_epoch_seconds(self._configs.get(readback.path))
+            earliest = requested_at - CAMERA_CLOCK_SYNC_TOLERANCE_SECONDS
+            latest = verified_at + CAMERA_CLOCK_SYNC_TOLERANCE_SECONDS
+            if reported is None or reported < earliest or reported > latest:
+                raise BridgeError(
+                    "CAMERA_CLOCK_VERIFY_FAILED",
+                    "gphoto2 accepted the camera clock action but the matching DATE widget did not "
+                    "confirm it "
+                    f"(expected={earliest}..{latest}, reported={reported if reported is not None else 'none'}).",
+                    status_code=502,
+                    feature=CameraFeature.CAMERA_CLOCK_SYNC.value,
+                    engine=self.engine_name,
+                )
+            self._observed.add(CameraFeature.CAMERA_CLOCK_SYNC)
+            return self.status()
+
+    def capture_still(self) -> CameraStatus:
+        with self._lock:
+            self._require_open()
+            capture_target = self._find_config(("capturetarget",), writable=True)
+            if capture_target is not None and _is_host_capture_target(capture_target.current):
+                if self._abilities.capture_image:
+                    self._capture_to_host_store()
+                    self._observed.add(CameraFeature.STILL_CAPTURE)
+                    return self.status()
+                self._ensure_capture_target_on_card(capture_target)
+
+            self._ensure_capture_target_on_card(capture_target)
+            if self._abilities.trigger_capture:
+                self._run(["--trigger-capture"], timeout=60.0)
+            elif self._abilities.capture_image:
+                self._run(["--capture-image"], timeout=60.0)
+            else:
+                raise unsupported(CameraFeature.STILL_CAPTURE.value, self.engine_name)
+            self._observed.add(CameraFeature.STILL_CAPTURE)
+            return self.status()
+
+    def _capture_to_host_store(self) -> None:
+        staging = self._capture_store.begin_capture()
+        timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+        basename = f"OEC_{timestamp}_{uuid.uuid4().hex[:12]}_%04n.%C"
+        mapped_directory = self.runner.host_path(staging).replace("%", "%%").rstrip("/\\")
+        filename_pattern = f"{mapped_directory}/{basename}"
+        try:
+            self._run(
+                ["--filename", filename_pattern, "--capture-image-and-download"],
+                timeout=120.0,
+            )
+            promoted = self._capture_store.promote_capture(staging)
+        except BridgeError as error:
+            self._capture_store.discard_capture(staging)
+            literal_directory = mapped_directory.replace("%%", "%")
+            redacted_message = error.message.replace(literal_directory, "<capture-directory>")
+            redacted_message = redacted_message.replace(os.fspath(staging), "<capture-directory>")
+            raise BridgeError(
+                error.code,
+                redacted_message,
+                status_code=error.status_code,
+                feature=error.feature,
+                engine=error.engine,
+            ) from error
+        except BaseException:
+            self._capture_store.discard_capture(staging)
+            raise
+        self._media_cache.update({item.id: item for item in promoted})
+
+    def _ensure_capture_target_on_card(self, config: GPhotoConfig | None = None) -> None:
+        config = config or self._find_config(("capturetarget",), writable=True)
+        if config is None:
+            return
+        card_value = _first_choice(config.choices, "Memory card", "Memory Card", "Card")
+        if card_value is None:
+            if config.current.casefold() in {"internal ram", "sdram"}:
+                raise BridgeError(
+                    "UNSAFE_CAPTURE_TARGET",
+                    "The camera is targeting host RAM but did not advertise a memory-card capture target.",
+                    status_code=409,
+                    feature=CameraFeature.STILL_CAPTURE.value,
+                    engine=self.engine_name,
+                )
+            return
+        if config.current.casefold() != card_value.casefold():
+            self._set_config_value(config, card_value, refresh=False)
+
+    def half_press_shutter(self) -> CameraStatus:
+        with self._lock:
+            values = self._half_press_values()
+            if values is None:
+                raise unsupported(CameraFeature.SHUTTER_HALF_PRESS.value, self.engine_name)
+            config, press_value, release_value = values
+            pressed = False
+            try:
+                self._set_config_value(config, press_value, refresh=False)
+                pressed = True
+                self._sleep(0.35)
+            finally:
+                if pressed:
+                    self._set_config_value(config, release_value, refresh=False)
+            self._observed.add(CameraFeature.SHUTTER_HALF_PRESS)
+            return self.status()
+
+    def start_bulb_exposure(self) -> CameraStatus:
+        with self._lock:
+            if self._bulb_exposure_active:
+                return self.status()
+            values = self._bulb_values()
+            if values is None:
+                raise unsupported(CameraFeature.BULB_EXPOSURE.value, self.engine_name)
+            baseline = self.status()
+            config, press_value, release_value = values
+            try:
+                self._set_config_value(config, press_value, refresh=False)
+            except BridgeError as error:
+                try:
+                    self._set_config_value(config, release_value, refresh=False)
+                except BridgeError as release_error:
+                    error.add_note(f"Bulb cleanup failed: {release_error.message}")
+                raise
+            self._bulb_exposure_active = True
+            return baseline.model_copy(update={"bulb_exposure_active": True})
+
+    def stop_bulb_exposure(self) -> CameraStatus:
+        with self._lock:
+            if not self._bulb_exposure_active:
+                return self.status()
+            values = self._bulb_values()
+            if values is None:
+                raise unsupported(CameraFeature.BULB_EXPOSURE.value, self.engine_name)
+            config, _, release_value = values
+            self._set_config_value(config, release_value, refresh=False)
+            self._bulb_exposure_active = False
+            self._observed.add(CameraFeature.BULB_EXPOSURE)
+            return self.status()
+
+    def autofocus(self) -> CameraStatus:
+        with self._lock:
+            configs = self._autofocus_configs()
+            if configs is None:
+                status = self.half_press_shutter()
+                self._observed.add(CameraFeature.AUTOFOCUS)
+                return status
+            drive, cancel = configs
+            primary_error: BaseException | None = None
+            try:
+                self._set_config_value(drive, "1", refresh=False)
+                self._sleep(0.35)
+            except BaseException as error:
+                primary_error = error
+                raise
+            finally:
+                try:
+                    self._set_config_value(cancel, "1", refresh=False)
+                except BaseException as cancel_error:
+                    if primary_error is None:
+                        raise
+                    primary_error.add_note(f"Canon EOS autofocus cancel also failed: {cancel_error}")
+            self._observed.add(CameraFeature.AUTOFOCUS)
+            return self.status()
+
+    def start_recording(self) -> CameraStatus:
+        return self._set_recording(True)
+
+    def stop_recording(self) -> CameraStatus:
+        return self._set_recording(False)
+
+    def drive_focus(self, direction: str, step: str) -> FocusResult:
+        with self._lock:
+            if not self._live_view_active:
+                raise BridgeError(
+                    "LIVE_VIEW_REQUIRED",
+                    "Manual focus drive requires an active Live View session.",
+                    status_code=409,
+                    feature=CameraFeature.FOCUS_DRIVE.value,
+                    engine=self.engine_name,
+                )
+            config = self._focus_drive_config()
+            if config is None:
+                raise unsupported(CameraFeature.FOCUS_DRIVE.value, self.engine_name)
+            normalized_direction = direction.upper()
+            normalized_step = step.upper()
+            step_number = {"SMALL": 1, "MEDIUM": 2, "LARGE": 3}.get(normalized_step)
+            if normalized_direction not in {"NEAR", "FAR"} or step_number is None:
+                raise BridgeError("INVALID_FOCUS_DRIVE", "direction and step are invalid.", status_code=422)
+            requested = f"{normalized_direction.title()} {step_number}"
+            value = _case_insensitive_choice(config.choices, requested)
+            if value is None:
+                raise unsupported(
+                    CameraFeature.FOCUS_DRIVE.value,
+                    self.engine_name,
+                    f"The camera did not advertise focus drive value '{requested}'.",
+                )
+            self._set_config_value(config, value, refresh=False)
+            self._observed.add(CameraFeature.FOCUS_DRIVE)
+            return FocusResult(accepted=True, direction=normalized_direction, step=normalized_step)
+
+    def set_live_view_magnification(self, value: int) -> LiveViewMagnificationResult:
+        with self._lock:
+            if not self._live_view_active:
+                raise BridgeError(
+                    "LIVE_VIEW_REQUIRED",
+                    "Live View magnification requires an active Live View session.",
+                    status_code=409,
+                    feature=CameraFeature.LIVE_VIEW_MAGNIFICATION.value,
+                    engine=self.engine_name,
+                )
+            config = self._live_view_magnification_config()
+            if config is None:
+                raise unsupported(CameraFeature.LIVE_VIEW_MAGNIFICATION.value, self.engine_name)
+            if value not in {1, 5}:
+                raise BridgeError(
+                    "INVALID_LIVE_VIEW_MAGNIFICATION",
+                    "Canon EOS Live View magnification must be 1x or 5x.",
+                    status_code=422,
+                    feature=CameraFeature.LIVE_VIEW_MAGNIFICATION.value,
+                    engine=self.engine_name,
+                )
+            self._set_config_value(config, str(value), refresh=False)
+            self._live_view_magnification = value
+            self._observed.add(CameraFeature.LIVE_VIEW_MAGNIFICATION)
+            return LiveViewMagnificationResult(accepted=True, value=value)
+
+    def tap_focus(self, x: float, y: float) -> FocusResult:
+        del x, y
+        raise unsupported(
+            CameraFeature.TAP_FOCUS.value,
+            self.engine_name,
+            "The libgphoto2 CLI engine has no verified normalized image-coordinate AF point command.",
+        )
+
+    def click_white_balance(self, x: float, y: float) -> CameraStatus:
+        del x, y
+        raise unsupported(
+            CameraFeature.CLICK_WHITE_BALANCE.value,
+            self.engine_name,
+            "The libgphoto2 CLI engine has no verified Live View coordinate Click WB command.",
+        )
+
+    def start_live_view(self, request: LiveViewStartRequest) -> None:
+        with self._lock:
+            if not self._abilities.capture_preview:
+                raise unsupported(CameraFeature.LIVE_VIEW.value, self.engine_name)
+            if request.source.upper() not in {"AUTO", "DESKTOP_BRIDGE_STREAM"}:
+                raise BridgeError("INVALID_LIVE_VIEW_SOURCE", "Unsupported Live View source.", status_code=422)
+            if request.size.upper() != "MEDIUM":
+                raise BridgeError(
+                    "INVALID_LIVE_VIEW_SIZE",
+                    "The gphoto2 CLI adapter currently advertises only MEDIUM preview size.",
+                    status_code=422,
+                )
+            viewfinder_enabled = self._set_viewfinder(True)
+            self._requested_fps = min(request.fps, MAX_BRIDGE_LIVE_VIEW_FPS)
+            self._live_view_fallback_reason = None
+            try:
+                try:
+                    self._start_movie_stream()
+                    assert self._live_view_stream is not None
+                    frame = self._live_view_stream.read_frame()
+                    self._live_view_transport = "GPHOTO2_CAPTURE_MOVIE"
+                except BridgeError as stream_error:
+                    self._fallback_to_capture_preview(stream_error)
+                    frame = self._capture_preview()
+            except BridgeError:
+                self._stop_movie_stream()
+                if viewfinder_enabled:
+                    try:
+                        self._set_viewfinder(False)
+                    except BridgeError as cleanup_error:
+                        self._last_error = cleanup_error.message
+                raise
+            self._cached_live_view_frame = frame
+            self._live_view_active = True
+            self._live_view_magnification = None
+            self._observed.update({CameraFeature.LIVE_VIEW, CameraFeature.LIVE_VIEW_JPEG_POLLING})
+
+    def stop_live_view(self) -> None:
+        with self._lock:
+            self._require_open()
+            was_live_view_active = self._live_view_active
+            self._live_view_active = False
+            self._stop_movie_stream()
+            try:
+                if was_live_view_active:
+                    self._set_viewfinder(False)
+            finally:
+                self._cached_live_view_frame = None
+                self._live_view_transport = None
+                self._live_view_magnification = None
+
+    def live_view_frame(self) -> bytes:
+        while True:
+            with self._lock:
+                if not self._live_view_active:
+                    raise BridgeError(
+                        "LIVE_VIEW_NOT_STARTED",
+                        "Start Live View before requesting a frame.",
+                        status_code=409,
+                        feature=CameraFeature.LIVE_VIEW.value,
+                        engine=self.engine_name,
+                    )
+                if self._cached_live_view_frame is not None:
+                    frame = self._cached_live_view_frame
+                    self._cached_live_view_frame = None
+                    return frame
+                if self._live_view_transport != "GPHOTO2_CAPTURE_MOVIE":
+                    return self._capture_preview()
+                if self._live_view_stream is None:
+                    self._start_movie_stream()
+                stream = self._live_view_stream
+                assert stream is not None
+
+            try:
+                return stream.read_frame()
+            except BridgeError as stream_error:
+                with self._lock:
+                    if not self._live_view_active:
+                        continue
+                    if self._live_view_stream is not stream:
+                        continue
+                    self._fallback_to_capture_preview(stream_error)
+                    return self._capture_preview()
+
+    def list_media(self, maximum_items: int | None = None) -> list[MediaItem]:
+        with self._lock:
+            if maximum_items is not None and maximum_items <= 0:
+                raise ValueError("maximum_items must be positive when provided")
+            host_items = self._capture_store.list_items()
+            if not self._camera_media_supported and not self._host_capture_supported() and not host_items:
+                raise unsupported(CameraFeature.MEDIA_BROWSER.value, self.engine_name)
+            camera_items: list[MediaItem] = []
+            if self._camera_media_supported:
+                output = self._run(["--recurse", "--list-files"], timeout=60.0).text
+                camera_items = parse_media_list(output)
+            all_items = sorted(
+                [*host_items, *camera_items],
+                key=lambda item: item.capture_time or "",
+                reverse=True,
+            )
+            items = all_items if maximum_items is None else all_items[:maximum_items]
+            if maximum_items is None:
+                self._media_cache = {item.id: item for item in items}
+            else:
+                self._media_cache.update({item.id: item for item in items})
+            self._observed.add(CameraFeature.MEDIA_BROWSER)
+            return items
+
+    def download_media(self, media_id: str) -> tuple[MediaItem, Iterator[bytes]]:
+        if is_host_media_id(media_id):
+            with self._lock:
+                self._require_open()
+                item, chunks = self._capture_store.stream(media_id)
+
+            def local_stream() -> Iterator[bytes]:
+                yield from chunks
+                with self._lock:
+                    self._observed.add(CameraFeature.MEDIA_DOWNLOAD)
+
+            return item, local_stream()
+
+        folder, name = _decode_media_id(media_id)
+        with self._lock:
+            self._require_open()
+            if not self._camera_media_supported:
+                raise unsupported(CameraFeature.MEDIA_DOWNLOAD.value, self.engine_name)
+            cached = self._media_cache.get(media_id)
+            content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+            item = cached or MediaItem(
+                id=media_id,
+                name=name,
+                kind=_media_kind(name, content_type),
+                content_type=content_type,
+            )
+
+        arguments = self._camera_arguments(["--folder", folder, "--get-file", name, "--stdout"])
+
+        def stream() -> Iterator[bytes]:
+            with self._lock:
+                self._require_open()
+                yield from self.runner.stream(arguments, timeout=600.0)
+                self._observed.add(CameraFeature.MEDIA_DOWNLOAD)
+
+        return item, stream()
+
+    def upload_media(
+        self,
+        filename: str,
+        source: Path,
+        size_bytes: int,
+        content_type: str,
+        cancelled: threading.Event | None = None,
+    ) -> MediaItem:
+        with self._lock:
+            self._require_open()
+            if not self._media_upload_supported():
+                raise unsupported(CameraFeature.MEDIA_UPLOAD.value, self.engine_name)
+            safe_filename, _, validated_size = validate_upload_request(
+                filename,
+                content_type,
+                str(size_bytes),
+            )
+            if validated_size != size_bytes:
+                raise BridgeError(
+                    "INVALID_UPLOAD_SIZE",
+                    "The upload size does not match the staged file size.",
+                    status_code=400,
+                    feature=CameraFeature.MEDIA_UPLOAD.value,
+                    engine=self.engine_name,
+                )
+            try:
+                actual_size = source.stat().st_size
+            except OSError as error:
+                raise BridgeError(
+                    "UPLOAD_SOURCE_UNAVAILABLE",
+                    "The staged upload file is unavailable.",
+                    status_code=500,
+                    feature=CameraFeature.MEDIA_UPLOAD.value,
+                    engine=self.engine_name,
+                ) from error
+            if actual_size != size_bytes or not source.is_file():
+                raise BridgeError(
+                    "INVALID_UPLOAD_SIZE",
+                    "The staged upload file size does not match Content-Length.",
+                    status_code=400,
+                    feature=CameraFeature.MEDIA_UPLOAD.value,
+                    engine=self.engine_name,
+                )
+            if cancelled is not None and cancelled.is_set():
+                raise _upload_cancelled()
+
+            self._refresh_storage(force=True, strict=True)
+            storage = self._upload_storage()
+            if storage is None:
+                raise unsupported(CameraFeature.MEDIA_UPLOAD.value, self.engine_name)
+            before = self.list_media()
+            if any(
+                item.name.casefold() == safe_filename.casefold()
+                and _decode_media_id(item.id)[0] == storage.base_dir
+                for item in before
+                if item.id.startswith("gphoto2:")
+            ):
+                raise BridgeError(
+                    "MEDIA_ALREADY_EXISTS",
+                    f"Media '{safe_filename}' already exists in the selected camera storage.",
+                    status_code=409,
+                    feature=CameraFeature.MEDIA_UPLOAD.value,
+                    engine=self.engine_name,
+                )
+
+            if cancelled is not None and cancelled.is_set():
+                raise _upload_cancelled()
+            self._run_cancellable(
+                [
+                    "--folder",
+                    storage.base_dir,
+                    "--filename",
+                    safe_filename,
+                    "--upload-file",
+                    self.runner.host_path(source),
+                ],
+                timeout=600.0,
+                cancelled=cancelled,
+            )
+            after = self.list_media()
+            matches = [
+                item
+                for item in after
+                if item.name.casefold() == safe_filename.casefold()
+                and item.id.startswith("gphoto2:")
+                and _decode_media_id(item.id)[0] == storage.base_dir
+            ]
+            if len(matches) != 1:
+                raise BridgeError(
+                    "UPLOAD_VERIFY_FAILED",
+                    "gphoto2 accepted the upload, but the camera did not report exactly one matching media item.",
+                    status_code=502,
+                    feature=CameraFeature.MEDIA_UPLOAD.value,
+                    engine=self.engine_name,
+                )
+            uploaded = matches[0]
+            if uploaded.size_bytes != size_bytes:
+                raise BridgeError(
+                    "UPLOAD_VERIFY_SIZE_MISMATCH",
+                    f"The camera reported {uploaded.size_bytes} bytes for an upload of {size_bytes} bytes.",
+                    status_code=502,
+                    feature=CameraFeature.MEDIA_UPLOAD.value,
+                    engine=self.engine_name,
+                )
+            self._observed.add(CameraFeature.MEDIA_UPLOAD)
+            return uploaded
+
+    def media_thumbnail(self, media_id: str) -> tuple[bytes, str]:
+        if is_host_media_id(media_id):
+            with self._lock:
+                self._require_open()
+                thumbnail = self._capture_store.thumbnail(media_id)
+                self._observed.add(CameraFeature.MEDIA_THUMBNAIL)
+                return thumbnail
+
+        folder, name = _decode_media_id(media_id)
+        with self._lock:
+            self._require_open()
+            if not self._camera_media_supported or not self._abilities.file_preview:
+                raise unsupported(CameraFeature.MEDIA_THUMBNAIL.value, self.engine_name)
+            output = self._run(
+                ["--folder", folder, "--get-thumbnail", name, "--stdout"],
+                timeout=60.0,
+            ).stdout
+            thumbnail, content_type = _validated_thumbnail(output)
+            self._observed.add(CameraFeature.MEDIA_THUMBNAIL)
+            return thumbnail, content_type
+
+    def media_preview(self, media_id: str) -> tuple[bytes, str]:
+        if is_host_media_id(media_id):
+            with self._lock:
+                self._require_open()
+                preview = self._capture_store.preview(media_id)
+                self._observed.add(CameraFeature.MEDIA_PREVIEW)
+                return preview
+
+        folder, name = _decode_media_id(media_id)
+        with self._lock:
+            self._require_open()
+            if not self._camera_media_supported:
+                raise unsupported(CameraFeature.MEDIA_PREVIEW.value, self.engine_name)
+            cached = self._media_cache.get(media_id)
+            content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+            if cached is not None and not cached.preview_available:
+                raise _media_preview_unavailable()
+            if cached is None and not is_previewable_media(name, content_type, 0):
+                raise _media_preview_unavailable()
+            output = self._run(
+                ["--folder", folder, "--get-file", name, "--stdout"],
+                timeout=60.0,
+            ).stdout
+            preview_type = preview_content_type(output)
+            if preview_type is None:
+                raise _media_preview_unavailable()
+            self._observed.add(CameraFeature.MEDIA_PREVIEW)
+            return output, preview_type
+
+    def delete_media(self, media_id: str) -> None:
+        if is_host_media_id(media_id):
+            with self._lock:
+                self._require_open()
+                self._capture_store.delete(media_id)
+                self._media_cache.pop(media_id, None)
+                self._observed.add(CameraFeature.MEDIA_DELETE)
+                return
+
+        folder, name = _decode_media_id(media_id)
+        with self._lock:
+            self._require_open()
+            if not self._camera_media_supported or not self._abilities.delete_files:
+                raise unsupported(CameraFeature.MEDIA_DELETE.value, self.engine_name)
+            self._run(["--folder", folder, "--delete-file", name], timeout=60.0)
+            self._media_cache.pop(media_id, None)
+            self._observed.add(CameraFeature.MEDIA_DELETE)
+
+    def media_info(self, media_id: str) -> MediaItem:
+        if is_host_media_id(media_id):
+            with self._lock:
+                self._require_open()
+                item, _ = self._capture_store.item(media_id)
+                self._media_cache[media_id] = item
+                self._observed.add(CameraFeature.MEDIA_BROWSER)
+                return item
+
+        folder, name = _decode_media_id(media_id)
+        with self._lock:
+            self._require_open()
+            if not self._camera_media_supported:
+                raise unsupported(CameraFeature.MEDIA_BROWSER.value, self.engine_name)
+            output = self._run(
+                ["--folder", folder, "--show-info", name],
+                timeout=60.0,
+            ).text
+            info = parse_media_info(output)
+            if not info.file_section_available:
+                raise BridgeError(
+                    "INVALID_MEDIA_INFO",
+                    "gphoto2 returned an invalid file-information response.",
+                    status_code=502,
+                    feature=CameraFeature.MEDIA_BROWSER.value,
+                    engine=self.engine_name,
+                )
+
+            content_type = info.content_type or "application/octet-stream"
+            size_bytes = info.size_bytes if info.size_bytes is not None else 0
+            item = MediaItem(
+                id=media_id,
+                name=name,
+                kind=_media_kind(name, content_type),
+                size_bytes=size_bytes,
+                capture_time=info.capture_time,
+                content_type=content_type,
+                width_pixels=info.width_pixels,
+                height_pixels=info.height_pixels,
+                preview_available=is_previewable_media(name, content_type, size_bytes),
+            )
+            self._media_cache[media_id] = item
+            self._observed.add(CameraFeature.MEDIA_BROWSER)
+            return item
+
+    def set_media_protection(self, media_id: str, enabled: bool) -> MediaItem:
+        del media_id, enabled
+        raise unsupported(CameraFeature.MEDIA_PROTECT.value, self.engine_name)
+
+    def set_media_rating(self, media_id: str, value: int) -> MediaItem:
+        del media_id, value
+        raise unsupported(CameraFeature.MEDIA_RATING.value, self.engine_name)
+
+    def set_media_rotation(self, media_id: str, degrees: int) -> MediaItem:
+        del media_id, degrees
+        raise unsupported(CameraFeature.MEDIA_ROTATE.value, self.engine_name)
+
+    def set_media_archive(self, media_id: str, enabled: bool) -> MediaItem:
+        del media_id, enabled
+        raise unsupported(CameraFeature.MEDIA_ARCHIVE.value, self.engine_name)
+
+    @property
+    def requested_fps(self) -> int:
+        return self._requested_fps
+
+    @property
+    def live_view_active(self) -> bool:
+        return self._live_view_active
+
+    @property
+    def live_view_source(self) -> str | None:
+        return "DESKTOP_BRIDGE_STREAM" if self._live_view_active else None
+
+    def _set_recording(self, recording: bool) -> CameraStatus:
+        with self._lock:
+            values = self._recording_values()
+            if values is None:
+                raise unsupported(CameraFeature.VIDEO_RECORDING.value, self.engine_name)
+            config, start_value, stop_value = values
+            self._set_config_value(config, start_value if recording else stop_value, refresh=False)
+            self._observed.add(CameraFeature.VIDEO_RECORDING)
+            return self.status()
+
+    def _capture_preview(self) -> bytes:
+        output = self._run(["--capture-preview", "--stdout"], timeout=30.0).stdout
+        start = output.find(b"\xff\xd8")
+        end = output.rfind(b"\xff\xd9")
+        if start < 0 or end < start:
+            raise BridgeError(
+                "INVALID_LIVE_VIEW_FRAME",
+                "gphoto2 capture-preview did not return a complete JPEG frame.",
+                status_code=502,
+                feature=CameraFeature.LIVE_VIEW.value,
+                engine=self.engine_name,
+            )
+        return output[start : end + 2]
+
+    def _start_movie_stream(self) -> None:
+        if self._live_view_stream is not None:
+            return
+        source = self.runner.open_stream(
+            self._camera_arguments(["--capture-movie", "--stdout"]),
+            timeout=LIVE_VIEW_STREAM_TIMEOUT_SECONDS,
+        )
+        stream = GPhotoMjpegSession(source, target_fps=self._requested_fps)
+        try:
+            stream.start()
+        except BaseException:
+            stream.close()
+            raise
+        self._live_view_stream = stream
+
+    def _stop_movie_stream(self) -> None:
+        stream = self._live_view_stream
+        self._live_view_stream = None
+        if stream is not None:
+            stream.close()
+
+    def _fallback_to_capture_preview(self, error: BridgeError) -> None:
+        self._stop_movie_stream()
+        self._live_view_transport = "GPHOTO2_CAPTURE_PREVIEW"
+        self._live_view_fallback_reason = error.message
+        self._last_error = error.message
+        self._requested_fps = min(self._requested_fps, MAX_PREVIEW_FALLBACK_FPS)
+
+    def _camera_settings(self) -> list[CameraSetting]:
+        settings: list[CameraSetting] = []
+        self._advertised_storage_targets = {}
+        for spec in CONFIG_SPECS:
+            config = self._find_config(spec.suffixes, writable=True)
+            if config is None:
+                continue
+            if spec.key == "capturestorage":
+                targets = self._capture_storage_targets(config)
+                if len(targets) < 2:
+                    continue
+                self._advertised_storage_targets = {label.casefold(): storage_id for label, storage_id in targets}
+                current_id = _normalize_storage_id(config.current)
+                current_value = next(
+                    (label for label, storage_id in targets if storage_id == current_id),
+                    "-",
+                )
+                settings.append(
+                    CameraSetting(
+                        key=spec.key,
+                        label=config.label or spec.label,
+                        value=current_value,
+                        values=[label for label, _ in targets],
+                    )
+                )
+                continue
+            values = self._setting_values(spec, config)
+            if not values or (not spec.core and len(values) < 2):
+                continue
+            current_value = _case_insensitive_choice(values, config.current) or "-"
+            settings.append(
+                CameraSetting(
+                    key=spec.key,
+                    label=config.label or spec.label,
+                    value=current_value,
+                    values=values,
+                )
+            )
+        for spec in TEXT_METADATA_SPECS:
+            config = self._find_config((spec.suffix,), writable=True)
+            if config is None or config.kind != "TEXT" or not _is_valid_text_metadata(config.current):
+                continue
+            settings.append(
+                CameraSetting(
+                    key=spec.key,
+                    label=config.label or spec.label,
+                    value=config.current,
+                    values=[],
+                    input_kind="text",
+                    max_length=TEXT_METADATA_MAX_BYTES,
+                )
+            )
+        return settings
+
+    def _media_upload_supported(self) -> bool:
+        return self._summary_supports_file_upload and self._upload_storage() is not None
+
+    def _upload_storage(self) -> StorageDevice | None:
+        writable = [
+            entry
+            for entry in self._storage.entries
+            if entry.writable is True
+            and bool(entry.base_dir)
+            and entry.base_dir.startswith("/")
+            and "\x00" not in entry.base_dir
+            and ".." not in entry.base_dir.split("/")
+        ]
+        if not writable:
+            return None
+        current_id = _normalize_storage_id(self._config_value("storageid"))
+        return next((entry for entry in writable if entry.storage_id == current_id), writable[0])
+
+    def _setting_values(self, spec: ConfigSpec, config: GPhotoConfig) -> list[str]:
+        values = config.selectable_values()
+        if spec.key == "alomode":
+            return [value for value in values if value.casefold() in CANON_AUTO_LIGHTING_OPTIMIZER_VALUES]
+        if spec.key == "autopoweroff":
+            return [value for value in values if value.casefold() not in {"4294967295", "0xffffffff"}]
+        if spec.key == "capturetarget":
+            return [
+                value
+                for value in values
+                if _is_card_capture_target(value) or (_is_host_capture_target(value) and self._abilities.capture_image)
+            ]
+        if spec.key == "capturestorage":
+            return [label for label, _ in self._capture_storage_targets(config)]
+        return values
+
+    def _capture_storage_targets(self, config: GPhotoConfig) -> list[tuple[str, str]]:
+        if config.kind != "TEXT":
+            return []
+        current_id = _normalize_storage_id(config.current)
+        writable = [
+            entry
+            for entry in self._storage.entries
+            if entry.writable is True and entry.storage_id is not None
+        ]
+        unique_by_id = {entry.storage_id: entry for entry in writable}
+        if len(unique_by_id) < 2 or current_id not in unique_by_id:
+            return []
+
+        entries = list(unique_by_id.values())
+        candidates = [
+            tuple(
+                candidate
+                for candidate in (
+                    _safe_storage_label(entry.description),
+                    _safe_storage_label(entry.label),
+                )
+                if candidate
+            )
+            for entry in entries
+        ]
+        selected: dict[str, str] = {}
+        used_labels: set[str] = set()
+        for entry, entry_candidates in zip(entries, candidates, strict=True):
+            unique_label = next(
+                (
+                    candidate
+                    for candidate in entry_candidates
+                    if sum(
+                        1
+                        for other_candidates in candidates
+                        if any(candidate.casefold() == other.casefold() for other in other_candidates)
+                    )
+                    == 1
+                    and candidate.casefold() not in used_labels
+                ),
+                None,
+            )
+            if unique_label is not None:
+                selected[entry.storage_id or ""] = unique_label
+                used_labels.add(unique_label.casefold())
+
+        reserved_labels = {
+            label.casefold()
+            for storage_id, label in self._storage_label_by_id.items()
+            if storage_id in unique_by_id
+        } | used_labels
+        next_card = 1
+        for entry in entries:
+            storage_id = entry.storage_id or ""
+            if storage_id in selected:
+                continue
+            cached = self._storage_label_by_id.get(storage_id)
+            if cached is not None and cached.casefold() not in used_labels:
+                selected[storage_id] = cached
+                used_labels.add(cached.casefold())
+                continue
+            while f"card {next_card}".casefold() in reserved_labels:
+                next_card += 1
+            label = f"Card {next_card}"
+            next_card += 1
+            selected[storage_id] = label
+            self._storage_label_by_id[storage_id] = label
+            reserved_labels.add(label.casefold())
+            used_labels.add(label.casefold())
+        return [(selected[entry.storage_id or ""], entry.storage_id or "") for entry in entries]
+
+    def _set_capture_storage(self, value: str) -> CameraStatus:
+        advertised_id = self._advertised_storage_targets.get(value.casefold())
+        if advertised_id is None:
+            raise BridgeError(
+                "INVALID_SETTING_VALUE",
+                f"Value '{value}' is not an advertised recording card.",
+                status_code=422,
+                engine=self.engine_name,
+            )
+
+        self._refresh_configs(force=True, strict=True)
+        self._refresh_storage(strict=True)
+        config = self._find_config(("storageid",), writable=True)
+        targets = self._capture_storage_targets(config) if config is not None else []
+        fresh_ids = {storage_id for _, storage_id in targets}
+        if config is None or advertised_id not in fresh_ids:
+            raise BridgeError(
+                "INVALID_SETTING_VALUE",
+                "The selected recording card is no longer advertised as writable by the camera.",
+                status_code=409,
+                engine=self.engine_name,
+            )
+        self._set_config_value(config, advertised_id, refresh=False)
+        self._observed.add(CameraFeature.ADVANCED_SETTINGS)
+        return self.status()
+
+    def _setting_value(self, key: str) -> str:
+        spec = next(candidate for candidate in CONFIG_SPECS if candidate.key == key)
+        config = self._find_config(spec.suffixes)
+        return config.current if config else "-"
+
+    def _set_config_value(
+        self,
+        config: GPhotoConfig,
+        value: str,
+        *,
+        refresh: bool = False,
+        update_current: bool = True,
+    ) -> None:
+        self._require_open()
+        if config.readonly:
+            raise BridgeError("READ_ONLY_SETTING", f"{config.label or config.path} is read-only.", status_code=409)
+        values = config.selectable_values()
+        selected_value = value
+        if values:
+            selected_value = _case_insensitive_choice(values, value)
+            if selected_value is None:
+                raise BridgeError(
+                    "INVALID_SETTING_VALUE",
+                    f"Value '{value}' is not advertised for {config.label or config.path}.",
+                    status_code=422,
+                    engine=self.engine_name,
+                )
+        self._run(["--set-config-value", f"{config.path}={selected_value}"], timeout=30.0)
+        if update_current:
+            config.current = selected_value
+        if refresh:
+            self._refresh_configs(force=True)
+
+    def _half_press_values(self) -> tuple[GPhotoConfig, str, str] | None:
+        config = self._find_config(("eosremoterelease",), writable=True)
+        if config is None:
+            return None
+        press = _first_choice(config.choices, "Press Half AF", "Press Half", "Press Half MF")
+        release = _first_choice(config.choices, "Release Half", "Release")
+        return (config, press, release) if press and release else None
+
+    def _bulb_values(self) -> tuple[GPhotoConfig, str, str] | None:
+        config = self._find_config(("eosremoterelease",), writable=True)
+        if config is None:
+            return None
+        press = _first_choice(config.choices, "Press Full AF", "Press Full", "Press Full MF")
+        release = _first_choice(config.choices, "Release Full", "Release")
+        return (config, press, release) if press and release else None
+
+    def _autofocus_configs(self) -> tuple[GPhotoConfig, GPhotoConfig] | None:
+        drive = self._find_config(("autofocusdrive",), writable=True)
+        cancel = self._find_config(("autofocuscancel",), writable=True)
+        return (drive, cancel) if drive is not None and cancel is not None else None
+
+    def _recording_values(self) -> tuple[GPhotoConfig, str, str] | None:
+        config = self._recording_config()
+        if config is None or config.readonly:
+            return None
+        start = _first_choice(config.choices, "Card")
+        stop = _first_choice(config.choices, "None")
+        return (config, start, stop) if start and stop else None
+
+    def _recording_config(self) -> GPhotoConfig | None:
+        return self._find_config(("movierecordtarget",))
+
+    def _focus_drive_config(self) -> GPhotoConfig | None:
+        config = self._find_config(("manualfocusdrive",), writable=True)
+        if config and any(choice.casefold().startswith(("near ", "far ")) for choice in config.choices):
+            return config
+        return None
+
+    def _live_view_magnification_config(self) -> GPhotoConfig | None:
+        return self._find_config(("eoszoom",), writable=True)
+
+    def _camera_clock_control(self) -> tuple[GPhotoConfig, GPhotoConfig] | None:
+        for action_suffix, readback_suffix in (
+            ("syncdatetimeutc", "datetimeutc"),
+            ("syncdatetime", "datetime"),
+        ):
+            action = self._find_config((action_suffix,), writable=True)
+            readback = self._find_config((readback_suffix,))
+            if action is not None and _config_epoch_seconds(readback) is not None:
+                return action, readback
+        return None
+
+    def _set_viewfinder(self, enabled: bool) -> bool:
+        config = self._find_config(("viewfinder",), writable=True)
+        if config is None:
+            return False
+        self._set_config_value(config, "1" if enabled else "0", refresh=False)
+        return True
+
+    def _host_capture_supported(self) -> bool:
+        config = self._find_config(("capturetarget",), writable=True)
+        return bool(
+            self._abilities.capture_image
+            and config is not None
+            and any(_is_host_capture_target(choice) for choice in config.choices)
+        )
+
+    def _still_capture_supported(self) -> bool:
+        if not (self._abilities.capture_image or self._abilities.trigger_capture):
+            return False
+        config = self._find_config(("capturetarget",), writable=True)
+        if config is None or not _is_host_capture_target(config.current):
+            return True
+        if self._abilities.capture_image:
+            return True
+        return _first_choice(config.choices, "Memory card", "Memory Card", "Card") is not None
+
+    def _capability_evidence(self) -> CapabilityEvidence:
+        commands: list[str] = []
+        if self._abilities.capture_image:
+            commands.append("CAPTURE_IMAGE")
+        if self._abilities.trigger_capture:
+            commands.append("TRIGGER_CAPTURE")
+        if self._abilities.capture_preview:
+            commands.append("CAPTURE_PREVIEW")
+            commands.append("CAPTURE_MOVIE_STDOUT")
+        if self._host_capture_supported():
+            commands.extend(
+                (
+                    "CAPTURE_IMAGE_AND_DOWNLOAD",
+                    "HOST_MEDIA_LIST",
+                    "HOST_MEDIA_DOWNLOAD",
+                    "HOST_MEDIA_THUMBNAIL",
+                    "HOST_MEDIA_PREVIEW",
+                    "HOST_MEDIA_DELETE",
+                )
+            )
+        if self._camera_media_supported:
+            commands.extend(("MEDIA_LIST", "MEDIA_PREVIEW", "MEDIA_DOWNLOAD"))
+            if self._abilities.file_preview:
+                commands.append("MEDIA_THUMBNAIL")
+            if self._abilities.delete_files:
+                commands.append("MEDIA_DELETE")
+        if self._autofocus_configs() is not None:
+            commands.append("AUTOFOCUS_DRIVE_CANCEL")
+        if self._half_press_values() is not None:
+            commands.append("SHUTTER_HALF_PRESS")
+        if self._bulb_values() is not None:
+            commands.append("BULB_PRESS_RELEASE")
+        if self._abilities.capture_preview and self._live_view_magnification_config() is not None:
+            commands.append("LIVE_VIEW_MAGNIFICATION_1X_5X")
+        if self._event_polling_supported:
+            commands.append("GPHOTO2_WAIT_EVENT")
+        if self._camera_clock_control() is not None:
+            commands.append("CAMERA_CLOCK_ACTION_WITH_DATE_READBACK")
+        if self._advertised_storage_targets:
+            commands.append("SET_CURRENT_STORAGE")
+        writable_setting_paths = {
+            config.path.replace("\r", "").replace("\n", "")[:MAX_CAPABILITY_EVIDENCE_ITEM_CHARS]
+            for config in self._configs.values()
+            if not config.readonly and config.selectable_values()
+        }
+        writable_setting_paths.update(
+            config.path.replace("\r", "").replace("\n", "")[:MAX_CAPABILITY_EVIDENCE_ITEM_CHARS]
+            for spec in TEXT_METADATA_SPECS
+            for config in [self._find_config((spec.suffix,), writable=True)]
+            if config is not None and config.kind == "TEXT" and _is_valid_text_metadata(config.current)
+        )
+        storage_config = self._find_config(("storageid",), writable=True)
+        if self._advertised_storage_targets and storage_config is not None:
+            writable_setting_paths.add(
+                storage_config.path.replace("\r", "").replace("\n", "")[:MAX_CAPABILITY_EVIDENCE_ITEM_CHARS]
+            )
+        writable_settings = sorted(writable_setting_paths)
+        return CapabilityEvidence(
+            source="gphoto2 --abilities + --list-all-config + --storage-info + --wait-event probe",
+            protocol_versions=(
+                [self.engine_version[:MAX_CAPABILITY_EVIDENCE_ITEM_CHARS]] if self.engine_version else []
+            ),
+            advertised_commands=commands,
+            writable_settings=writable_settings[:MAX_CAPABILITY_EVIDENCE_ITEMS],
+            observed_features=sorted(self._observed, key=str)[:MAX_CAPABILITY_EVIDENCE_ITEMS],
+            truncated=(
+                len(writable_settings) > MAX_CAPABILITY_EVIDENCE_ITEMS
+                or len(self._observed) > MAX_CAPABILITY_EVIDENCE_ITEMS
+            ),
+        )
+
+    def _refresh_configs(self, *, force: bool, strict: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_config_refresh < CONFIG_REFRESH_SECONDS:
+            return
+        try:
+            output = self._run(["--list-all-config"], timeout=45.0).text
+            parsed = parse_config_dump(output)
+            if parsed:
+                self._configs = parsed
+            elif strict:
+                raise BridgeError(
+                    "INVALID_CAMERA_RESPONSE",
+                    "gphoto2 returned no camera configuration during a strict refresh.",
+                    status_code=502,
+                    engine=self.engine_name,
+                )
+            self._last_error = None
+        except BridgeError as error:
+            self._last_error = error.message
+            if strict:
+                self._last_config_refresh = now
+                raise
+        self._last_config_refresh = now
+
+    def _refresh_storage(self, *, force: bool = True, strict: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_storage_refresh < CONFIG_REFRESH_SECONDS:
+            return
+        try:
+            output = self._run(["--storage-info"], timeout=30.0).text
+            self._storage = parse_storage_info(output)
+            self._last_error = None
+        except BridgeError as error:
+            self._last_error = error.message
+            if strict:
+                self._last_storage_refresh = now
+                raise
+        self._last_storage_refresh = now
+
+    def _probe_event_polling(self) -> None:
+        try:
+            output = self._run(
+                ["--wait-event", GPHOTO_EVENT_PROBE_ARGUMENT],
+                timeout=GPHOTO_EVENT_COMMAND_TIMEOUT_SECONDS,
+            )
+            self._event_polling_supported = True
+            self._event_polling_reason = None
+            self._pending_event_keys = parse_wait_event_keys(output.text)
+        except BridgeError as error:
+            self._event_polling_supported = False
+            self._event_polling_reason = f"gphoto2 --wait-event probe failed: {error.message}"
+            self._pending_event_keys = []
+
+    def _find_config(self, suffixes: tuple[str, ...], *, writable: bool = False) -> GPhotoConfig | None:
+        candidates = [
+            config
+            for config in self._configs.values()
+            if any(config.path.casefold().endswith(f"/{suffix.casefold()}") for suffix in suffixes)
+            and (not writable or not config.readonly)
+        ]
+        candidates.sort(
+            key=lambda config: (
+                config.readonly,
+                not config.path.startswith(("/main/imgsettings/", "/main/capturesettings/", "/main/actions/")),
+                config.path,
+            )
+        )
+        return candidates[0] if candidates else None
+
+    def _config_value(self, suffix: str) -> str | None:
+        config = self._find_config((suffix,))
+        return config.current if config and config.current else None
+
+    def _probe(self, arguments: list[str]) -> bool:
+        try:
+            self._run(arguments, timeout=20.0)
+            return True
+        except BridgeError as error:
+            self._last_error = error.message
+            return False
+
+    def _optional_text(self, arguments: list[str], *, timeout: float) -> str:
+        try:
+            return self._run(arguments, timeout=timeout).text
+        except BridgeError as error:
+            self._last_error = error.message
+            return ""
+
+    def _run(self, arguments: list[str], *, timeout: float) -> CommandOutput:
+        self._require_open()
+        self._stop_movie_stream()
+        return self.runner.run(self._camera_arguments(arguments), timeout=timeout)
+
+    def _run_cancellable(
+        self,
+        arguments: list[str],
+        *,
+        timeout: float,
+        cancelled: threading.Event | None,
+    ) -> CommandOutput:
+        if cancelled is None:
+            return self._run(arguments, timeout=timeout)
+        self._require_open()
+        self._stop_movie_stream()
+        run_cancellable = getattr(self.runner, "run_cancellable", None)
+        if callable(run_cancellable):
+            return run_cancellable(
+                self._camera_arguments(arguments),
+                timeout=timeout,
+                cancelled=cancelled,
+            )
+        if cancelled.is_set():
+            raise _upload_cancelled()
+        output = self.runner.run(self._camera_arguments(arguments), timeout=timeout)
+        if cancelled.is_set():
+            raise _upload_cancelled()
+        return output
+
+    def _camera_arguments(self, arguments: list[str]) -> list[str]:
+        return ["--port", self.camera.port, *arguments]
+
+    def _require_open(self) -> None:
+        if self._closed:
+            raise BridgeError(
+                "SESSION_CLOSED", "The camera session is closed.", status_code=410, engine=self.engine_name
+            )
+
+
+def _camera_id(port: str) -> str:
+    encoded = base64.urlsafe_b64encode(port.encode()).decode().rstrip("=")
+    return f"gphoto2-{encoded}"
+
+
+def _media_id(folder: str, name: str) -> str:
+    payload = json.dumps([folder, name], separators=(",", ":")).encode()
+    return "gphoto2:" + base64.urlsafe_b64encode(payload).decode().rstrip("=")
+
+
+def _decode_media_id(media_id: str) -> tuple[str, str]:
+    if not media_id.startswith("gphoto2:"):
+        raise BridgeError("INVALID_MEDIA_ID", "Media ID does not belong to gphoto2.", status_code=422)
+    encoded = media_id.removeprefix("gphoto2:")
+    try:
+        payload = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
+        folder, name = json.loads(payload)
+    except (ValueError, TypeError, json.JSONDecodeError) as error:
+        raise BridgeError("INVALID_MEDIA_ID", "Media ID is malformed.", status_code=422) from error
+    if (
+        not isinstance(folder, str)
+        or not isinstance(name, str)
+        or not folder.startswith("/")
+        or not name
+        or "/" in name
+        or any(character in folder + name for character in ("\x00", "\r", "\n"))
+    ):
+        raise BridgeError("INVALID_MEDIA_ID", "Media ID contains an invalid camera path.", status_code=422)
+    return folder, name
+
+
+def _leading_int(value: str) -> int | None:
+    match = re.match(r"(-?\d+)", value.strip())
+    return int(match.group(1)) if match else None
+
+
+def _parse_gphoto_local_time(value: str) -> str | None:
+    try:
+        local_time = datetime.strptime(re.sub(r"\s+", " ", value.strip()), "%a %b %d %H:%M:%S %Y")
+        timestamp = time.mktime(local_time.timetuple())
+    except (OSError, OverflowError, ValueError):
+        return None
+    return datetime.fromtimestamp(timestamp, UTC).isoformat().replace("+00:00", "Z")
+
+
+def _storage_size_bytes(value: str, *, default_unit: str) -> int | None:
+    match = re.match(r"(\d+)\s*([KMGT]?B)?(?:\s|$)", value.strip(), re.I)
+    if match is None:
+        return None
+    unit = match.group(2) or default_unit
+    return int(match.group(1)) * _size_multiplier(unit)
+
+
+def _parse_float(value: str) -> float | None:
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def _parse_available_shots(value: str | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        parsed = int(value.strip(), 10)
+    except ValueError:
+        return None
+    return parsed if 0 <= parsed < 0xFFFF_FFFF else None
+
+
+def _format_number(value: float) -> str:
+    return f"{value:.6f}".rstrip("0").rstrip(".")
+
+
+def _size_multiplier(unit: str) -> int:
+    return {
+        "B": 1,
+        "KB": 1024,
+        "MB": 1024**2,
+        "GB": 1024**3,
+        "TB": 1024**4,
+    }.get(unit.upper(), 1)
+
+
+def _validated_thumbnail(output: bytes) -> tuple[bytes, str]:
+    if len(output) > MAX_MEDIA_THUMBNAIL_BYTES:
+        raise BridgeError(
+            "MEDIA_THUMBNAIL_LIMIT",
+            f"gphoto2 returned a thumbnail larger than {MAX_MEDIA_THUMBNAIL_BYTES} bytes.",
+            status_code=502,
+            feature=CameraFeature.MEDIA_THUMBNAIL.value,
+            engine=ENGINE_NAME,
+        )
+    jpeg_start = output.find(b"\xff\xd8")
+    jpeg_end = output.rfind(b"\xff\xd9")
+    if jpeg_start >= 0 and jpeg_end >= jpeg_start:
+        return output[jpeg_start : jpeg_end + 2], "image/jpeg"
+    if output.startswith(b"\x89PNG\r\n\x1a\n"):
+        return output, "image/png"
+    raise BridgeError(
+        "INVALID_MEDIA_THUMBNAIL",
+        "gphoto2 did not return a supported JPEG or PNG thumbnail.",
+        status_code=502,
+        feature=CameraFeature.MEDIA_THUMBNAIL.value,
+        engine=ENGINE_NAME,
+    )
+
+
+def _media_preview_unavailable() -> BridgeError:
+    return BridgeError(
+        "MEDIA_PREVIEW_UNAVAILABLE",
+        f"This media item is not a complete JPEG or PNG image within the {MAX_MEDIA_PREVIEW_BYTES} byte limit.",
+        status_code=422,
+        feature=CameraFeature.MEDIA_PREVIEW.value,
+        engine=ENGINE_NAME,
+    )
+
+
+def _media_kind(name: str, content_type: str) -> str:
+    lowered = content_type.casefold()
+    if lowered.startswith("image/"):
+        return "image"
+    if lowered.startswith("video/"):
+        return "video"
+    extension = os.path.splitext(name)[1].casefold()
+    if extension in {".jpg", ".jpeg", ".png", ".heif", ".heic", ".cr2", ".cr3", ".dng"}:
+        return "image"
+    if extension in {".mp4", ".mov", ".avi", ".mkv"}:
+        return "video"
+    return "other"
+
+
+def _battery_level(value: str | None) -> int | None:
+    if value is None:
+        return None
+    match = re.search(r"(\d{1,3})\s*%", value)
+    if match:
+        return min(int(match.group(1)), 100)
+    if value.casefold() == "full":
+        return 100
+    return None
+
+
+def _battery_status(level: int | None, raw: str | None) -> str:
+    if level is not None:
+        return "low" if level <= 20 else "normal"
+    return raw or "unknown"
+
+
+def _first_choice(choices: list[str], *candidates: str) -> str | None:
+    for candidate in candidates:
+        found = _case_insensitive_choice(choices, candidate)
+        if found is not None:
+            return found
+    return None
+
+
+def _case_insensitive_choice(choices: list[str], candidate: str) -> str | None:
+    normalized = candidate.casefold()
+    return next((choice for choice in choices if choice.casefold() == normalized), None)
+
+
+def _normalize_storage_id(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    if not re.fullmatch(r"[0-9a-f]{8}", normalized, re.I):
+        return None
+    return normalized.upper()
+
+
+def _safe_storage_label(value: str) -> str:
+    return re.sub(r"[\r\n\t]+", " ", value).strip()[:80]
+
+
+def _is_valid_text_metadata(value: str) -> bool:
+    try:
+        encoded = value.encode("ascii")
+    except UnicodeEncodeError:
+        return False
+    return len(encoded) <= TEXT_METADATA_MAX_BYTES and all(0x20 <= byte <= 0x7E for byte in encoded)
+
+
+def _is_host_capture_target(value: str) -> bool:
+    return value.strip().casefold() in {"internal ram", "sdram"}
+
+
+def _is_card_capture_target(value: str) -> bool:
+    return value.strip().casefold() in {"memory card", "card"}
+
+
+def _feature_for_setting(key: str) -> CameraFeature:
+    if key in {"iso", "shutter", "aperture"}:
+        return CameraFeature.EXPOSURE_CONTROL
+    if key == "whitebalance":
+        return CameraFeature.WHITE_BALANCE_CONTROL
+    return CameraFeature.ADVANCED_SETTINGS

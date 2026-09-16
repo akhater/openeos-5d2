@@ -1,0 +1,694 @@
+name: CI
+
+on:
+  pull_request:
+
+concurrency:
+  group: ci-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    outputs:
+      android: ${{ steps.changes.outputs.android }}
+      android_ui: ${{ steps.changes.outputs.android_ui }}
+      camera_import_contract: ${{ steps.changes.outputs.camera_import_contract }}
+      simulator: ${{ steps.changes.outputs.simulator }}
+      desktop: ${{ steps.changes.outputs.desktop }}
+      ios_core: ${{ steps.changes.outputs.ios_core }}
+      ios_app: ${{ steps.changes.outputs.ios_app }}
+
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Classify affected product surfaces
+        id: changes
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            android:
+              - 'android/**'
+              - '!android/camera-import-contract/**'
+              - 'simulator/**'
+              - 'scripts/release/verify-android-apk-signing.sh'
+              - '.github/workflows/**'
+            android_ui:
+              - 'android/app/src/main/**'
+              - 'android/app/src/androidTest/**'
+              - 'android/app/src/debug/**'
+              - 'android/app/build.gradle.kts'
+              - 'android/build.gradle.kts'
+              - 'android/settings.gradle.kts'
+              - 'android/gradle/**'
+              - 'android/gradle.properties'
+              - 'android/gradlew'
+              - 'android/gradlew.bat'
+              - 'simulator/**'
+              - '.github/workflows/**'
+            camera_import_contract:
+              - 'contracts/camera-import/**'
+              - 'scripts/contracts/**'
+              - 'android/camera-import-contract/**'
+              - 'android/app/build.gradle.kts'
+              - 'android/build.gradle.kts'
+              - 'android/settings.gradle.kts'
+              - 'android/gradle/**'
+              - 'android/gradle.properties'
+              - 'android/gradlew'
+              - 'android/gradlew.bat'
+              - 'scripts/release/release_candidate.py'
+              - 'scripts/release/tests/test_release_candidate.py'
+              - '.github/workflows/**'
+            simulator:
+              - 'simulator/**'
+              - '.github/workflows/**'
+            desktop:
+              - 'bridge/**'
+              - 'simulator/**'
+              - 'scripts/windows-gphoto2-doctor.ps1'
+              - '.github/workflows/**'
+            ios_core:
+              - 'ios/OpenEOSCore/**'
+              - '.github/workflows/**'
+            ios_app:
+              - 'ios/**'
+              - 'simulator/**'
+              - '.github/workflows/**'
+
+      - name: Scan repository history for secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="gitleaks_8.30.1_linux_x64.tar.gz"
+          curl --fail --location --silent --show-error \
+            --output "$RUNNER_TEMP/$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/$archive"
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  $RUNNER_TEMP/$archive" \
+            | sha256sum --check --strict
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" git . \
+            --config .gitleaks.toml \
+            --redact \
+            --no-banner \
+            --no-color \
+            --timeout 300
+
+      - name: Verify product version consistency
+        run: python3 scripts/release/verify-version.py
+
+      - name: Test physical-camera evidence verifier
+        run: python3 -m unittest discover -s scripts/validation/tests -p "test_*.py"
+
+      - name: Test CI and release workflow helpers
+        run: |
+          python3 -m unittest discover -s scripts/ci/tests -p "test_*.py"
+          python3 -m unittest discover -s scripts/release/tests -p "test_*.py"
+
+      - name: Validate and package Camera Import contract
+        if: steps.changes.outputs.camera_import_contract == 'true'
+        run: |
+          python3 -m pip install --disable-pip-version-check --requirement scripts/contracts/requirements.txt
+          python3 -m unittest discover -s scripts/contracts/tests -p "test_*.py"
+          python3 scripts/contracts/camera_import.py validate
+          python3 scripts/contracts/camera_import.py build --output-dir dist
+
+      - name: Validate GitHub Actions workflows
+        run: bash scripts/ci/run-actionlint.sh
+
+      - name: Upload Camera Import schema release candidate
+        if: steps.changes.outputs.camera_import_contract == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-candidate-camera-import-contract
+          path: dist/open-eos-camera-import-contract-*.zip
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          overwrite: true
+
+  test:
+    needs: secret-scan
+    if: needs.secret-scan.outputs.android == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up JDK
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+
+      - name: Prepare Gradle wrapper
+        run: chmod +x gradlew
+
+      - name: Run unit tests
+        run: ./gradlew :app:testDebugUnitTest
+
+      - name: Build pull-request debug APK
+        run: ./gradlew :app:assembleDebug
+
+      - name: Smoke-test pull-request APK signer verification
+        shell: bash
+        run: |
+          set -euo pipefail
+          verifier="../scripts/release/verify-android-apk-signing.sh"
+          apk="app/build/outputs/apk/debug/app-debug.apk"
+          actual="$(bash "$verifier" "$apk")"
+          printf '%s\n' "$actual" > "$RUNNER_TEMP/pull-request-certificate-sha256.txt"
+          bash "$verifier" "$apk" "$RUNNER_TEMP/pull-request-certificate-sha256.txt"
+
+  camera-import-contract:
+    needs: secret-scan
+    if: needs.secret-scan.outputs.camera_import_contract == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up JDK
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+
+      - name: Prepare Gradle wrapper
+        run: chmod +x gradlew
+
+      - name: Test and build Camera Import Kotlin contract
+        run: ./gradlew :camera-import-contract:test :camera-import-contract:jar
+
+      - name: Upload Camera Import Kotlin release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-candidate-camera-import-kotlin
+          path: android/camera-import-contract/build/libs/open-eos-camera-import-contract-kotlin-*.jar
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          overwrite: true
+
+  android-ui:
+    needs: secret-scan
+    if: needs.secret-scan.outputs.android_ui == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up JDK
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+
+      - name: Prepare Gradle wrapper
+        run: chmod +x gradlew
+
+      - name: Enable KVM access
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Start fake camera for Android end-to-end tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e "../simulator"
+          nohup python -m uvicorn main:app --host 0.0.0.0 --port 18080 \
+            > "$RUNNER_TEMP/android-camera-simulator.log" 2>&1 &
+          for _ in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:18080/health > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/android-camera-simulator.log"
+          exit 1
+
+      - name: Run UI tests on Pixel API 34
+        uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.34.0
+        with:
+          api-level: 34
+          arch: x86_64
+          profile: pixel_5
+          emulator-boot-timeout: 900
+          emulator-options: -no-snapshot -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          working-directory: android
+          disable-animations: true
+          script: ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.requireSimulator=true
+
+      - name: Upload Android UI test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-ui-test-results
+          path: |
+            android/app/build/reports/androidTests/connected/debug
+            android/app/build/outputs/androidTest-results/connected/debug
+            android/app/build/outputs/connected_android_test_additional_output
+            ${{ runner.temp }}/android-camera-simulator.log
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: true
+
+  android-ui-api36:
+    needs: secret-scan
+    if: needs.secret-scan.outputs.android_ui == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: android
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up JDK
+        uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@9c971963bec38e04b3d30dcc455b5382be2fdbfb # v6.3.0
+
+      - name: Prepare Gradle wrapper
+        run: chmod +x gradlew
+
+      - name: Enable KVM access
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Start fake camera for Android 16 end-to-end tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e "../simulator"
+          nohup python -m uvicorn main:app --host 0.0.0.0 --port 18080 \
+            > "$RUNNER_TEMP/android-camera-simulator-api36.log" 2>&1 &
+          for _ in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:18080/health > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/android-camera-simulator-api36.log"
+          exit 1
+
+      - name: Run UI tests on Pixel API 36
+        uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.34.0
+        with:
+          api-level: 36
+          arch: x86_64
+          profile: pixel_5
+          emulator-boot-timeout: 900
+          emulator-options: -no-snapshot -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+          working-directory: android
+          disable-animations: true
+          script: ./gradlew :app:connectedDebugAndroidTest -Pandroid.testInstrumentationRunnerArguments.requireSimulator=true
+
+      - name: Upload Android 16 UI test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: android-ui-test-results-api36
+          path: |
+            android/app/build/reports/androidTests/connected/debug
+            android/app/build/outputs/androidTest-results/connected/debug
+            android/app/build/outputs/connected_android_test_additional_output
+            ${{ runner.temp }}/android-camera-simulator-api36.log
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: true
+
+  simulator:
+    needs: secret-scan
+    if: needs.secret-scan.outputs.simulator == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: simulator
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: Install simulator and test dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Lint simulator
+        run: ruff check --no-cache .
+
+      - name: Test simulator contract
+        run: pytest -q
+
+  desktop-bridge:
+    needs: secret-scan
+    if: needs.secret-scan.outputs.desktop == 'true'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: bridge
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: bridge/package-lock.json
+
+      - name: Install bridge and test dependencies
+        run: |
+          python -m pip install build==1.5.0 -e ".[dev]"
+          npm ci
+          npx playwright install --with-deps chromium
+
+      - name: Lint desktop bridge
+        run: ruff check --no-cache . ../scripts/validation
+
+      - name: Check desktop control scripts
+        run: |
+          node --check open_eos_bridge/static/icons.js
+          node --check open_eos_bridge/static/diagnostics.js
+          node --check open_eos_bridge/static/monitoring.js
+          node --check open_eos_bridge/static/local-video.js
+          node --check open_eos_bridge/static/rtp-audio.js
+          node --check open_eos_bridge/static/media-transfer.js
+          node --check open_eos_bridge/static/app.js
+          npm run test:modules
+
+      - name: Test desktop browser control
+        run: npm run test:browser
+
+      - name: Test desktop bridge contract
+        run: pytest -q -p no:cacheprovider
+
+      - name: Build Desktop Bridge release candidate
+        run: python -m build --outdir ../dist
+
+      - name: Upload Desktop Bridge release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-candidate-desktop-bridge
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14
+          overwrite: true
+
+      - name: Upload desktop browser screenshots
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: desktop-browser-screenshots
+          path: bridge/test-results
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: true
+
+  desktop-windows-bundle:
+    needs: secret-scan
+    if: needs.secret-scan.outputs.desktop == 'true'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: bridge
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install standalone bundle dependencies
+        run: python -m pip install -e ".[bundle]"
+
+      - name: Build Windows standalone Desktop Bridge
+        run: python scripts/build_standalone.py --output-dir ../dist --work-dir build/standalone
+
+      - name: Launch and verify Windows standalone Desktop Bridge
+        shell: pwsh
+        run: |
+          $artifact = Get-ChildItem ../dist/open-eos-control-bridge-windows-x64-*.exe |
+            Select-Object -First 1
+          if (-not $artifact) {
+            throw "Windows standalone Desktop Bridge artifact was not created."
+          }
+          python scripts/verify_standalone.py $artifact.FullName
+          & $artifact.FullName --version
+
+      - name: Upload Windows standalone release candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-candidate-desktop-windows
+          path: dist/open-eos-control-bridge-windows-x64-*.exe
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          overwrite: true
+
+  ios-core:
+    needs: secret-scan
+    if: needs.secret-scan.outputs.ios_core == 'true'
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: ios/OpenEOSCore
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Show Swift toolchain
+        run: swift --version
+
+      - name: Test iOS CCAPI core
+        run: swift test
+
+  ios-app:
+    needs: secret-scan
+    if: needs.secret-scan.outputs.ios_app == 'true'
+    runs-on: macos-15
+    defaults:
+      run:
+        working-directory: ios/OpenEOSControl
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Install XcodeGen
+        run: command -v xcodegen >/dev/null || brew install xcodegen
+
+      - name: Validate app metadata
+        run: |
+          plutil -lint App/Info.plist
+          xcodegen generate
+          xcodebuild -project OpenEOSControl.xcodeproj -scheme OpenEOSControl -list
+
+      - name: Build iOS app
+        run: |
+          xcodebuild \
+            -project OpenEOSControl.xcodeproj \
+            -scheme OpenEOSControl \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath .derived-data \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Verify bundled app resources
+        run: |
+          APP_PATH=".derived-data/Build/Products/Debug-iphonesimulator/OpenEOSControl.app"
+          test -f "$APP_PATH/Assets.car"
+          test -f "$APP_PATH/en.lproj/Localizable.strings"
+          test -f "$APP_PATH/zh-Hant.lproj/Localizable.strings"
+          plutil -extract UILaunchScreen xml1 -o /dev/null "$APP_PATH/Info.plist"
+          test -n "$(plutil -extract NSLocalNetworkUsageDescription raw -o - "$APP_PATH/Info.plist")"
+          test "$(plutil -extract NSAppTransportSecurity.NSAllowsLocalNetworking raw -o - "$APP_PATH/Info.plist")" = "true"
+          ORIENTATIONS=$(plutil -extract UISupportedInterfaceOrientations xml1 -o - "$APP_PATH/Info.plist")
+          grep -q UIInterfaceOrientationPortrait <<< "$ORIENTATIONS"
+          grep -q UIInterfaceOrientationLandscapeLeft <<< "$ORIENTATIONS"
+          grep -q UIInterfaceOrientationLandscapeRight <<< "$ORIENTATIONS"
+          if grep -q UIInterfaceOrientationPortraitUpsideDown <<< "$ORIENTATIONS"; then
+            echo "Whole-window upside-down orientation must remain disabled"
+            exit 1
+          fi
+
+      - name: Start fake camera for iOS end-to-end tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install -e "../../simulator"
+          nohup python -m uvicorn main:app --host 0.0.0.0 --port 18080 \
+            > "$RUNNER_TEMP/ios-camera-simulator.log" 2>&1 &
+          for _ in {1..30}; do
+            if curl --fail --silent --show-error http://127.0.0.1:18080/health > /dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          cat "$RUNNER_TEMP/ios-camera-simulator.log"
+          exit 1
+
+      - name: Select iPhone simulator
+        id: simulator
+        run: |
+          DEVICE_ID=$(xcrun simctl list devices available -j | python3 -c '
+          import json, sys
+          data = json.load(sys.stdin)
+          devices = [device for runtime, values in data["devices"].items() if ".iOS-" in runtime for device in values if device["name"].startswith("iPhone") and device.get("isAvailable", False)]
+          if not devices:
+              raise SystemExit("No available iPhone simulator")
+          print(devices[0]["udid"])
+          ')
+          echo "device_id=$DEVICE_ID" >> "$GITHUB_OUTPUT"
+          xcrun simctl boot "$DEVICE_ID" || true
+          xcrun simctl bootstatus "$DEVICE_ID" -b
+
+      - name: Test iOS app and UI
+        run: |
+          rm -rf TestResults.xcresult
+          xcodebuild \
+            -project OpenEOSControl.xcodeproj \
+            -scheme OpenEOSControl \
+            -destination 'platform=iOS Simulator,id=${{ steps.simulator.outputs.device_id }}' \
+            -derivedDataPath .derived-data \
+            -resultBundlePath TestResults.xcresult \
+            CODE_SIGNING_ALLOWED=NO \
+            "SWIFT_ACTIVE_COMPILATION_CONDITIONS=\$(inherited) OEC_REQUIRE_SIMULATOR_E2E" \
+            test
+
+      - name: Upload iOS test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ios-test-results
+          path: |
+            ios/OpenEOSControl/TestResults.xcresult
+            ${{ runner.temp }}/ios-camera-simulator.log
+          if-no-files-found: ignore
+          retention-days: 7
+          overwrite: true
+
+  ci-complete:
+    if: always()
+    needs:
+      - secret-scan
+      - test
+      - camera-import-contract
+      - android-ui
+      - android-ui-api36
+      - simulator
+      - desktop-bridge
+      - desktop-windows-bundle
+      - ios-core
+      - ios-app
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Require every CI job to pass
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          require_job() {
+            local expected="$1"
+            local actual="$2"
+            local name="$3"
+            if [[ "$expected" == "true" ]]; then
+              if [[ "$actual" != "success" ]]; then
+                echo "$name must succeed for this change set; actual result: $actual" >&2
+                exit 1
+              fi
+            elif [[ "$actual" != "skipped" ]]; then
+              echo "$name must be skipped when its product surface is unchanged; actual result: $actual" >&2
+              exit 1
+            fi
+          }
+
+          test "${{ needs.secret-scan.result }}" = success
+          require_job "${{ needs.secret-scan.outputs.android }}" "${{ needs.test.result }}" test
+          require_job "${{ needs.secret-scan.outputs.camera_import_contract }}" "${{ needs.camera-import-contract.result }}" camera-import-contract
+          require_job "${{ needs.secret-scan.outputs.android_ui }}" "${{ needs.android-ui.result }}" android-ui
+          require_job "${{ needs.secret-scan.outputs.android_ui }}" "${{ needs.android-ui-api36.result }}" android-ui-api36
+          require_job "${{ needs.secret-scan.outputs.simulator }}" "${{ needs.simulator.result }}" simulator
+          require_job "${{ needs.secret-scan.outputs.desktop }}" "${{ needs.desktop-bridge.result }}" desktop-bridge
+          require_job "${{ needs.secret-scan.outputs.desktop }}" "${{ needs.desktop-windows-bundle.result }}" desktop-windows-bundle
+          require_job "${{ needs.secret-scan.outputs.ios_core }}" "${{ needs.ios-core.result }}" ios-core
+          require_job "${{ needs.secret-scan.outputs.ios_app }}" "${{ needs.ios-app.result }}" ios-app
+          echo "PR CI complete for $GITHUB_SHA"

@@ -1,0 +1,201 @@
+# Changelog
+
+All notable release-level changes to Open EOS Control are documented here.
+
+## [Unreleased]
+
+## [0.10.0] - 2026-09-08
+
+- Android: save recognized photo/video originals directly into a camera-model Pictures folder, matching the observed Camera Connect destination. Pending writes, length verification, cleanup and non-overwriting names protect downloads; unsupported RAW formats and explicit exports retain SAF.
+- Android: publish recent metadata in batches of eight, retain known dates when opening the full card, cancel off-screen thumbnails and suspend competing album requests during downloads. Large same-date groups no longer repeatedly copy the accumulated list.
+- Android-only scope. Physical R6 Mark III large-card/transfer validation and PC/iOS parity remain pending; Camera Import contract is unchanged.
+
+## [0.9.2] - 2026-09-07
+
+- Fixed rotated and large-font Android shooting labels through consistent pre-layout text measurement, retaining fixed touch slots and complete Photo/Video labels.
+- Added compact English/Traditional Chinese white-balance and card-ready labels while preserving full accessible details. Exposure, remaining-shot counts, and duration values no longer split numeric tokens across lines.
+- Separated magnification icons and values and fitted FPS, AF, and REC/Bulb labels without changing camera commands, system rotation policy, or AF release recovery.
+- Validated 360 shooting-screen configurations and 168 white-balance cases, 507 local Android unit tests, lint/builds, 135 unique HTC offline/mock-camera UI/protocol tests, and feature API 34/36 CI. Physical R6 Mark III defocus remains pending; this is not whole-App or PC/iOS layout acceptance. PC/iOS are version-aligned only, and Camera Import artifact 1.1.0/wire 1.0 remains unchanged.
+
+## [0.9.1] - 2026-09-06
+
+- Fixed Android CCAPI short AF and manual half-press cleanup so a failed release remains retryable using the original stop/release operation, never another start. Failed manual releases retain `af=false`.
+- Retained the focus interlock until release acknowledgement, blocked conflicting commands in both directions, and prevented late focus results from corrupting a replacement connection.
+- Added an accessible stop-only recovery control even when the camera lacks held AF support, with English/Traditional Chinese descriptions and tested fixed-size touch targets.
+- Validated with 507 Android unit tests, lint/builds, 132 unique HTC mock-camera UI/protocol tests, and API 34/36 CI. Physical R6 Mark III defocus remains pending; existing rotated large-font HUD clipping is not resolved by this patch. PC/iOS are version-aligned only; USB/Bridge recovery parity and new manual full-press/Bulb recovery are not claimed. Camera Import artifact 1.1.0/wire 1.0 remains unchanged.
+
+## [0.9.0] - 2026-09-06
+
+- Added a Photo-mode shutter autofocus switch for Android direct CCAPI, gated by advertised native shutter operations. It defaults on, resets for each connection, and sends the selected boolean through the production capture path.
+- Turning shutter autofocus off shows a localized, accessible shutter indicator without changing camera AF modes or claiming focus lock. Video/Bulb and unsupported transports retain their existing behavior; busy, recording, and held-AF states prevent conflicting changes.
+- Manual shutter cleanup still requests release with `af=false`, including failed presses. Temperature checks and held-AF stop interlocks remain in effect.
+- Validated protocol/state behavior, full UI-to-HTTP capture, and focused layouts with Android unit tests, HTC mock-camera tests, and API 34/36 CI. Real R6 Mark III optical/capture behavior and the reported camera-body defocus remain pending. PC/iOS are version-aligned only; Camera Import artifact 1.1.0/wire 1.0 is unchanged.
+
+## [0.8.0] - 2026-09-06
+
+- Added capability-gated press-and-hold AF-ON for Android direct CCAPI, using the camera-advertised AF start/stop endpoint without changing camera AF modes or assuming half-press support implies held AF support.
+- Release, cancellation, window focus loss, leaving controls, backgrounding, and disconnect request AF stop. Failed stops retain a stop-only retry and block new conflicting commands; the app-side hold watchdog is not a camera-side lease or a guarantee after process death/network loss.
+- Added lifecycle, gesture, accessibility, and density-aware safe-area tests across Android API 34/36. Camera command acknowledgement remains distinct from camera-reported focus and actual photograph sharpness.
+- This feature is Android direct-CCAPI only. Release AF-ON before using the App shutter; simultaneous held AF/capture, PC/iOS/USB/Bridge parity, physical R6 Mark III validation, and the reported body-side defocus comparison remain pending.
+
+## [0.7.0] - 2026-09-06
+
+- Added Android camera-reported selected AF frames and focus states through advertised Canon `flipdetail?kind=info`, with sparse corner rendering, crop-aware geometry, one-second expiry, bounded reads, and lifecycle-safe cancellation/invalidation.
+- Fixed Android remote Live View so disabling it or leaving the foreground stops the camera-side stream, resumes only when requested, and preserves safe capture/Bulb cleanup and visible stop failures.
+- Replaced unconfirmed green focus-command success with neutral acknowledgement. Actual camera-reported focus, command acceptance, and optical sharpness validation remain distinct.
+- Product behavior changes are Android-only. PC/iOS versions are aligned for distribution; camera-side manual-shooting defocus, AF geometry/modes, and sustained metadata load still require physical validation.
+
+## [0.6.3] - 2026-08-24
+
+- Fixed Android recent-media ordering across separate photo and video containers by using bounded Canon media-info timestamps when available, while retaining deterministic camera order when dates are unavailable.
+- Added limited retries for transient Android camera read transfers with a fresh destination for each attempt, and replaced raw socket exception banners with localized timeout and reconnection guidance.
+
+## [0.6.2] - 2026-08-24
+
+- Fixed Android capability loss after a transient shooting-settings refresh by retaining the last valid response and recovering ISO, Tv, Av, and WB only from camera-advertised read/write endpoints.
+- Corrected Android Live View placement so the decoded frame, tap coordinates, monitoring overlays, focus feedback, and capture flash share the viewport between the fixed header and capture controls.
+
+## [0.6.1] - 2026-08-24
+
+- Fixed the Android exposure picker so ISO, shutter, aperture, and white-balance tabs no longer overlap the current value. Phone layouts now show three complete values, tablet layouts show five, and the camera-write progress indicator no longer shifts the tabs.
+
+## [0.6.0] - 2026-08-21
+
+- Added Android handoff from a single camera item or a multi-selection to Serein through explicit, temporary read-only `content://` grants. Open EOS Control stages and hashes complete originals, accepts only exact-session receipt batches, and verifies imported byte lengths and SHA-256 values without modifying camera media.
+- Extended Camera Import Contract artifact `1.1.0` with strict Android handoff and receipt-batch schemas, bilingual integration rules, portable valid/invalid fixtures, and a JVM 17 Kotlin codec shared with the receiving app.
+- Fixed CCAPI event synchronization so camera-side recording transitions update the Android UI without requiring a manual refresh.
+
+## [0.5.0] - 2026-08-21
+
+- Added Google Photos-style Android camera-media selection: long press enters selection, continuous drag selects or clears ranges, edge holding auto-scrolls, and stable media IDs preserve the selection across filtering and sorting.
+- Added capability-gated Android batch download, protection, archive, rating, display rotation, and confirmed deletion. Operations run sequentially against the active camera transport, report item progress and partial failures, and never turn a rejected camera operation into success.
+- Added English and Traditional Chinese selection UI, accessibility semantics, enlarged-text coverage, reducer/ViewModel tests, and real touch-drag Compose tests on Android API 34 and API 36.
+- Clarified that Development Preview is the only active release channel. Pending physical-device evidence limits compatibility claims but does not by itself block a prerelease.
+
+## [0.4.0] - 2026-08-19
+
+- Extended the bounded recent-media flow to iOS and the PC control UI with explicit Recent/Full card controls, localized scope summaries, one-item lookahead, and scope-aware diagnostics.
+- Added `GET /v1/session/{id}/media?limit=1..1000` across the Desktop Bridge contract and Android/iOS Bridge clients. Direct CCAPI stops media-leaf pagination early while still sampling sibling photo/video containers; libgphoto2 documents that its recursive CLI listing remains complete before the HTTP response is bounded.
+- Added a cross-platform just-captured media shortcut. Android, iOS, and PC request at most eight camera-ordered items after connection and successful still capture, retry bounded propagation delays, retain the previous thumbnail until a replacement is ready, and open the existing viewer without first enumerating the full card.
+- Added cancellation and session guards, bounded Android thumbnail decoding, privacy-safe latest-media diagnostics, generated Simulator capture timestamps, and end-to-end coverage for recent preview availability and interaction.
+- Replaced repeated PR, `main`, and tag rebuilds with an exact-SHA promotion flow. Full PR CI produces tested candidates, `main` verifies the squash-merged Git tree and adds the stable-signed Android APK, and version tags publish the same provenance-checked candidate.
+
+## [0.3.1] - 2026-08-19
+
+- Changed the Android camera-media entry point to load the newest 60 items first, with an explicit full-card option and a one-item lookahead that reports when more media is available without presenting a partial count as the card total.
+- Bounded direct CCAPI and Android USB/PTP recent-media enumeration, merged newly announced camera events into the recent view, and preserved camera order when capture timestamps are unavailable.
+- Limited Android thumbnail work to two concurrent requests, retried transient thumbnail I/O once, and added localized English/Traditional Chinese load-scope status plus redacted diagnostics.
+
+## [0.3.0] - 2026-08-14
+
+- Rebuilt the Android, iOS, and PC media library for large camera cards with complete camera-advertised container/page traversal, progressive results, explicit loading completeness, cancellation, camera-order preservation, natural/date sorting, filtering, and deterministic coverage beyond 500 items.
+- Added full-screen photo viewing with bounded zoom and pan, thumbnails and display previews, plus read-only format, dimensions, file size, and capture-time details where the active transport can report them. Metadata writes and deletion remain independently capability-gated.
+- Hardened camera-resident video preview across Android, iOS, and PC. Mobile CCAPI sessions now preflight missing file sizes through the advertised media-info representation so non-seekable camera responses can fall back to an exact verified local file; Android supplies the real filename and container MIME to Media3; iOS ignores generic `application/octet-stream`, clamps tail byte ranges to the declared file length, and decodes a real H.264 fixture through the production AVFoundation resource loader. Browser errors now distinguish unsupported codecs from transport failures while preserving original download.
+- Added in-place camera-video playback recovery across Android, iOS, and PC. Transport, truncated-range, staging, and storage failures retain an explicit retry that rebuilds the platform playback source, Swift camera stream, or browser playback ticket; codec failures identify the MP4/MOV/M4V/AVI/MKV container and keep original download available without promising that a retry can add a missing decoder.
+- Kept the iOS progressive media-load indicator inside the compact summary region so upload and cancel remain visible and hittable on narrow iPhones.
+- Extended Android USB/PTP, Desktop Bridge/libgphoto2, direct CCAPI, and Simulator media contracts without inventing unavailable camera metadata; each UI exposes only operations advertised by its active backend.
+
+## [0.2.0] - 2026-08-12
+
+- Hardened Android, iOS, and PC Canon CCAPI discovery and Live View for EOS R6 Mark III firmware 1.1.0, including Canon developer-list fallback, POST-only lifecycle cleanup, advertised-size downgrade, bounded multipart and busy retries, RTP first-frame readiness, and deterministic AUTO fallback.
+- Added capability-gated R6 Mark III movie quality, cropping, recording-format, sound-recording, microphone, wind-filter, attenuator, and manual-level handling across Android, iOS, PC, and Simulator, with exact advertised values and fresh readback contracts.
+- Completed a non-destructive production-engine and installed-Android-AVD pass against a physical EOS R6 Mark III, covering discovery, 118 advertised reads, 28 reversible setting writes/restores, JPEG and multipart Live View, 6/15/30 FPS reporting, focus, events, and bounded media traversal/preview/download.
+- Added fresh, read-only libgphoto2 per-item media information through the existing Desktop Bridge API, while preserving Live View restart and rejecting malformed or stale metadata.
+- Improved iOS Desktop Bridge FPS control, cross-platform media enumeration, event cleanup, capability evidence, and camera-control UI reliability.
+
+## [0.1.10] - 2026-08-10
+
+- Added capability-gated Canon CCAPI media archive state and writes across Android, iOS, PC and Simulator. Clients require an advertised contents `PUT`, send Canon's exact `archive` action with `enable` or `disable`, and require a matching bounded `kind=info` readback before reporting success or observed evidence. Unknown archive state stays hidden, offline previews mutate locally, and the iOS metadata sheet now opens at a usable large detent.
+
+## [0.1.9] - 2026-08-10
+
+- Added capability-gated wired media upload across Android, iOS and PC. Android USB uses standard PTP `SendObjectInfo`/`SendObject` only with advertised operations, a writable card and a matching object format, snapshots SAF input before the transaction, requires exact ObjectInfo readback, and drops a partial/cancelled PTP session. Desktop Bridge requires runtime libgphoto2 File Upload evidence, exact bounded raw bodies, writable storage, cancellable gPhoto2 subprocesses and fresh name/size verification; iOS and Android Bridge clients stream file-backed requests with bounded responses. Direct Canon CCAPI remains explicitly unsupported, while Simulator-only contracts preserve exact bytes and enforce matching filename/MIME categories.
+- Added capability-gated Canon CCAPI multipart JPEG Live View across Android, iOS, PC and Simulator. AUTO now prefers RTP, then a persistent `/shooting/liveview/multipart` stream, then bounded JPEG polling. Each client requires GET/DELETE multipart plus the regular start/stop lifecycle in one API version, continuously drains the stream while conflating old frames, validates bounded MIME headers, `Content-Length` and complete JPEG markers, records support from advertisement and observation only after a valid frame, and performs multipart DELETE before regular Live View cleanup.
+- Added capability-gated Canon CCAPI sensor cleaning across Android, iOS, PC and Simulator. The maintenance action appears only for an advertised `POST /functions/sensorcleaning`, sends Canon's strict boolean `autopoweroff` body, requires HTTP 200, pauses Live View/event polling and either restores the session or disconnects after clean-and-power-off. Recording, Bulb, preview and conflicting operations remain disabled; libgphoto2 and Android USB make no unsupported cleaning claim.
+- Added capability-gated Canon CCAPI Auto Power Off and immediate camera sleep across Android, iOS, PC and Simulator. Timed controls require an exact same-version GET/PUT pair, a fresh valid ability read and documented non-immediate values; `immediately` is excluded from normal settings and becomes a separate confirmed action only when advertised. Accepted sleep stops local work and disconnects, while libgphoto2 and Android USB make no unsupported immediate-sleep claim.
+- Added capability-gated Canon CCAPI camera beep and display-off timeout across Android, iOS, PC and Simulator. Both controls require exact same-version GET/PUT endpoint pairs, a valid documented string ability containing the current value, and a fresh pre-write read; malformed, stale, single-choice and cross-version contracts stay hidden or fail without a camera write, while Canon busy/recording responses remain authoritative.
+- Hardened Canon CCAPI discovery across Android, iOS and PC for firmware/model responses that identify a protocol version but contain no valid root commands. Clients now query Canon's documented `/ccapi/ver100/topurlfordev` list in that case, accept only validated same-origin method/path entries, and keep every control disabled when the developer list is empty, malformed or unavailable.
+- Added capability-gated Canon CCAPI movie quality, high frame rate, cropping and recording format across Android, iOS, PC and Simulator. Video settings require exact same-version GET/PUT endpoint pairs, bounded camera-advertised string abilities and a fresh pre-write read; readable quality summaries remain separate from exact protocol tokens, while Still, recording, malformed, stale and cross-version states stay unavailable or fail without a write.
+- Added capability-gated Canon CCAPI focus bracketing across Android, iOS, PC and Simulator. Photo settings expose enablement, shot count, focus increment and exposure smoothing only from exact same-version GET/PUT endpoint pairs after the root contract validates; integer ranges are bounded, every write re-reads camera abilities, and Movie, busy, shooting, malformed, stale and cross-version states remain unavailable or real failures.
+- Added capability-gated Canon CCAPI sound recording mode, wind filter and attenuator across Android, iOS, PC and Simulator. Each control requires an exact same-version GET/PUT pair, a unique documented string ability containing the current value, and a fresh pre-write read; all three remain Video-only and transient Canon 503 responses stay authoritative.
+- Added capability-gated Canon CCAPI sound recording level across Android, iOS, PC and Simulator. Clients require matching same-version `GET`/`PUT /shooting/settings/soundrecording/level`, strictly validate Canon's integer current/min/max/step contract, re-read the range before each write, send an integer `value`, and expose the control as a Video-only discrete slider. Malformed, single-choice, oversized, stale and cross-version contracts stay hidden or fail without a write.
+- Added capability-gated Canon CCAPI lens and temperature status across Android, iOS, PC and Simulator. Clients use only advertised `GET /devicestatus/lens` and `GET /devicestatus/temperature`, strictly validate Canon's documented payloads, expose localized warnings and redacted diagnostics, refresh temperature immediately before still capture, recording start and Live View start, and never block the corresponding stop/release cleanup commands.
+- Added capability-gated Canon CCAPI Movie Mode synchronization across Android, iOS, PC and Simulator. Photo/Video selection now uses matching same-version `GET`/`POST /shooting/control/moviemode`, accepts only Canon's `on`/`off` status, sends the exact `action` body, and remains local-only when the camera does not advertise a valid writable endpoint. Failed writes retain the camera-confirmed mode instead of leaving an optimistic UI state.
+- Added capability-gated Canon CCAPI optical zoom across Android, iOS, PC and Simulator. Clients require matching same-version GET/POST discovery, validate the bounded integer range, send Canon's integer POST body only after slider release, and hide the control when the active camera/lens does not expose it.
+- Added a required iOS HTTP-preset workflow that explicitly bypasses localhost Simulator detection and drives the production SwiftUI app through Canon discovery, versioned JPEG Live View and Canon 1.1 event polling. External ISO and still-capture events must update the exposure strip and an open media view without manual refresh, and disconnect must issue event DELETE plus Live View cleanup. Event refreshes now wait for active controls/media work and retry when a newer operation revision would otherwise let a stale snapshot overwrite interactive state.
+- Added a required Android HTTP-preset workflow that explicitly bypasses the Simulator shortcut and drives the production UI, ViewModel, repository, and `CcapiClient` through Canon-style discovery, versioned settings/capture, JPEG Live View, Canon 1.1 event polling, camera-side ISO synchronization, and GET/DELETE cleanup. Simulator intent is now carried explicitly from the connection preset while the previous localhost heuristic remains only as a compatibility fallback when intent is unspecified.
+- Extended the required PC Wireless CCAPI browser workflow through Canon 1.1 `GET`/`DELETE /event/polling`. External camera-side ISO and media changes now prove that the production event loop refreshes authoritative settings and an open media view without manual refresh, while disconnect proves that the in-flight long poll is explicitly cancelled. Browser refresh generations prevent an older event response from overwriting a newer interactive command; media refreshes requested during an active command now wait and re-read instead of silently leaving an empty page; diagnostic/physical-validation copies hold one consistent visible report through SHA-256 generation.
+- Added a required PC Wireless CCAPI browser workflow that drives the production UI, FastAPI service, and `CcapiEngine` against Canon-shaped HTTP discovery and control endpoints. It asserts exposure, clock sync, balanced AF and half-press, still capture, R6 Mark III Live View 400 fallback, decoded JPEG frames, geometry-backed Tap AF/Click WB, focus drive, recording, Bulb, media preview/delete, diagnostics, and disconnect cleanup against simulator state.
+- Expanded the PC browser workflow from visual interaction checks to exact UI-to-FastAPI-to-libgphoto2 command assertions for ISO, AF drive/cancel, half-press/release, host capture, media preview/delete, Live View, manual focus, magnification, recording, Bulb and disconnect cleanup. Blocking MJPEG frame waits now release the camera lock so controls can interrupt and restart the persistent stream, while browser teardown aborts in-flight frame requests without a false 409 error.
+- Expanded iOS's required direct-CCAPI Simulator workflow through balanced AF-ON and shutter half-press, coordinate Tap AF, Click White Balance, manual focus drive, mode-gated Bulb start/stop, decoded media preview, confirmed deletion, and backend-state assertions. Swift Simulator sessions now advertise and execute the existing focus-drive and Bulb contracts instead of hiding them as planned capabilities, while an explicit image-bounded interaction layer makes Live View taps reliably hittable and accessible.
+- Expanded Android's required CCAPI Simulator device workflow through Tap AF, Click White Balance, balanced AF-ON and shutter half-press, validated manual focus drive, mode-gated Bulb start/stop, decoded media display preview, confirmed deletion, and backend-state assertions. The Simulator now rejects invalid focus-drive values and Bulb starts outside Bulb mode instead of reporting false success.
+- Refined Android's fixed Photo/Video mode rail with direction-aware labels, a rotating short selection underline, and a retained 48dp hit target inset from the physical edge. Sideways Traditional Chinese and 130% text now stay camera-like without a fixed selection rectangle turning into a clipped vertical block.
+- Added a complete Android 16/API 36 Pixel UI gate alongside the existing API 34 job. Both run the production Simulator path and retain device-frame plus user-view screenshots for fixed camera geometry, system rotation lock, Traditional Chinese, enlarged text, and orientation-aware reading surfaces.
+- Added an Android physical-camera validation checklist that exposes only advertised-and-observed features, requires explicit camera-side confirmation, rejects Simulator and Offline Preview sessions, clears confirmations across connections, and copies a privacy-safe Markdown record bound to the sanitized diagnostic by SHA-256.
+- Extended the same physical-camera validation workflow to iOS and the PC control UI with memory-only confirmations, native CryptoKit/Web Crypto SHA-256 binding, simulator rejection, localized UI, and browser/iPhone interaction coverage.
+- Stabilized the Android rotation-lock launch test by setting and restoring the system auto-rotate preference independently from the display user-rotation lock.
+
+## [0.1.8] - 2026-08-01
+
+- Added capability-gated Android playback for Canon CCAPI RTP `MP4A-LATM/48000` camera audio. Android now scopes SDP format parameters, performs bounded RFC 6416 fragmentation/loss recovery, extracts raw AAC with Media3's AOSP-derived LATM parser, decodes through `MediaCodec`, and streams PCM through `AudioTrack`. Monitoring remains default-muted, stops when the app enters the background, and reports packet/decode/playback health without allowing audio failure to stop video.
+- Added capability-gated PC playback for Canon CCAPI RTP `MP4A-LATM/48000` camera audio. The Bridge now parses SDP format parameters, reassembles RFC 6416 audioMuxElements, decodes in-band LATM through PyAV/FFmpeg, exposes bounded authenticated PCM long polling and reports audio status independently from video. The browser remains muted until a user enables audio and tears playback down on every Live View/source/session transition.
+- Added capability-gated iOS playback for Canon CCAPI RTP `MP4A-LATM/48000` camera audio. iOS now binds the separately advertised Wi-Fi UDP port, performs bounded RFC 6416 reassembly and AAC-LC LATM extraction, decodes through `AVAudioConverter`, and schedules PCM through `AVAudioEngine`. Monitoring is default-muted, foreground-only, session-scoped, independently diagnosed, and cannot stop ready video.
+- Expanded Android's quarter-turn reading viewport and split offline guidance into an atomic icon/title row plus a full-long-axis description row. Bounded font fitting now preserves complete English and Traditional Chinese copy at up to 200% font scale while the camera layout remains fixed.
+
+## [0.1.7] - 2026-07-31
+
+- Added capability-gated Canon Auto Lighting Optimizer control to Android USB/PTP and the libgphoto2 Desktop Bridge. Exact `AloMode (0xD1C1)` UINT32 values are allow-listed from pinned upstream evidence; one-choice R6 Mark III `x3` state remains diagnostic-only, while usable advertised lists receive English and Traditional Chinese UI across Android, iOS, and PC.
+- Added capability-gated camera date/time synchronization across Android, iOS, and the Desktop Bridge. Direct CCAPI writes Canon's RFC 1123 value and DST flag, then verifies a GET readback; direct Android USB prefers Canon EOS `UTCTime (0xD17C)` and falls back to `CameraTime (0xD113)`, requiring a matching post-write event; USB Bridge sessions require a writable libgphoto2 `syncdatetimeutc`/`syncdatetime` action paired with its DATE widget and verify a fresh camera-config readback.
+- Added English and Traditional Chinese clock controls, success timestamps, diagnostics, simulator state, and deterministic CCAPI/Bridge/libgphoto2 contract coverage.
+- Reconciled Android's public auto-rotate setting on start, resume, focus return, every posture sample, and immediately while Quick Settings owns focus; the orientation listener stops entirely while rotation lock is active so no stale sensor callback can rotate camera controls.
+- Kept compact HUD atoms in fixed slots, stacked status icons over their exact values, and retained complete viewfinder copy through a centered portrait layout or a quarter-turn inline layout derived from the available Live View long axis. Settings content still remeasures against swapped axes across the full fixed panel.
+
+## [0.1.6] - 2026-07-30
+
+- Made Android camera controls follow the system auto-rotate setting by default, with explicit always-rotate and fixed alternatives.
+- Kept the camera composition fixed while atomic controls rotate in place using quarter-turn-aware measurement.
+- Preserved the complete English and Traditional Chinese offline preview copy in a bounded, readable sideways viewport.
+- Added orientation policy and effective angle to diagnostics, with emulator and Compose coverage for rotation lock, localization, and enlarged text.
+
+## [0.1.5] - 2026-07-30
+
+- Established a stable Android development signing identity for `main` artifacts and tagged releases so previews from `0.1.5` onward can update in place.
+- Kept the private key outside Git while pinning and verifying its public SHA-256 certificate fingerprint before every APK upload.
+- Preserved ordinary pull-request and local debug builds without exposing release signing secrets.
+
+## [0.1.4] - 2026-07-30
+
+- Added memory-only 3D `.cube` LUT preview to decoded Live View on Android, iOS, and PC, using bounded parsers and platform-native GPU paths without exposing LUT identity in diagnostics.
+- Added mutually exclusive luminance histogram and waveform scopes across Android, iOS, and PC.
+- Reworked Android camera orientation behavior so the composition remains fixed while bounded controls follow physical orientation only when the Android system auto-rotate setting is enabled.
+- Added compact quarter-turn camera HUD content, bounded readable notices, and nested-rotation protection for Traditional Chinese and enlarged text.
+- Added a seven-day Android debug APK artifact to successful `main` CI runs for faster physical-camera validation before a tagged release.
+
+## [0.1.0] - 2026-07-26
+
+Initial development preview.
+
+- Added direct Canon CCAPI control on Android, iOS, and the Desktop Bridge.
+- Added Android USB/PTP and capability-gated Canon EOS USB control.
+- Added JPEG and capability-gated RTP H.264 Live View with adjustable display FPS.
+- Added still capture, recording, exposure, white balance, focus, media, and diagnostic workflows where the connected backend advertises support.
+- Added English and Traditional Chinese interfaces plus offline UI preview.
+- Added a simulator, deterministic cross-platform tests, public protocol references, and pre-push secret scanning.
+
+This preview still requires broader Canon EOS R6 Mark III physical-device validation. iOS is distributed as source; physical-device builds must be built and signed by the developer.
+
+[0.1.0]: https://github.com/js051/open-eos-control/releases/tag/v0.1.0
+[0.1.4]: https://github.com/js051/open-eos-control/releases/tag/v0.1.4
+[0.1.5]: https://github.com/js051/open-eos-control/releases/tag/v0.1.5
+[0.1.6]: https://github.com/js051/open-eos-control/releases/tag/v0.1.6
+[0.1.7]: https://github.com/js051/open-eos-control/releases/tag/v0.1.7
+[0.1.8]: https://github.com/js051/open-eos-control/releases/tag/v0.1.8
+[0.1.9]: https://github.com/js051/open-eos-control/releases/tag/v0.1.9
+[0.1.10]: https://github.com/js051/open-eos-control/releases/tag/v0.1.10
+[0.2.0]: https://github.com/js051/open-eos-control/releases/tag/v0.2.0
+[0.3.0]: https://github.com/js051/open-eos-control/releases/tag/v0.3.0
+[0.3.1]: https://github.com/js051/open-eos-control/releases/tag/v0.3.1
+[0.4.0]: https://github.com/js051/open-eos-control/releases/tag/v0.4.0
+[0.5.0]: https://github.com/js051/open-eos-control/releases/tag/v0.5.0
+[0.6.0]: https://github.com/js051/open-eos-control/releases/tag/v0.6.0
+[0.6.1]: https://github.com/js051/open-eos-control/releases/tag/v0.6.1
