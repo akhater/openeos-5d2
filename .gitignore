@@ -1,0 +1,14 @@
+# Android / Gradle
+android/**/build/
+android/.gradle/
+android/local.properties
+android/**/*.iml
+android/.idea/
+
+# Java/Eclipse (vendor reference project, in case anyone opens it)
+vendor/remoteyourcam-usb/bin/
+vendor/remoteyourcam-usb/gen/
+
+# OS
+Thumbs.db
+.DS_Store
