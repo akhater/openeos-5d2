@@ -242,7 +242,8 @@ object CanonEosPtp {
         CanonEosEventCode.REQUEST_OBJECT_TRANSFER_64_LFN,
     )
 
-    fun isCanonEos(info: PtpDeviceInfo): Boolean = info.vendorExtensionId == VENDOR_EXTENSION_ID
+    fun isCanonEos(info: PtpDeviceInfo): Boolean =
+        info.vendorExtensionId == VENDOR_EXTENSION_ID || info.manufacturer.contains("Canon", ignoreCase = true)
 
     fun supportsRemotePreparation(info: PtpDeviceInfo): Boolean =
         isCanonEos(info) && remotePreparationOperations.all(info::supports)

@@ -73,12 +73,57 @@ The "not advertised" result is more likely one of:
 3. A genuinely different (older) `GetDeviceInfo` response shape for the
    5D2 that the parser doesn't handle.
 
-## Next step (blocked on real data)
+## Resolved: confirmed root cause
 
-Need the actual advertised-operations evidence from a live 5D2 session:
-the app's own diagnostics report (README: "Bounded, secret-redacted
-capability evidence showing ... advertised commands") lists the raw
-`0x----` operation codes the camera returned. Once we have that list, we
-can tell definitively whether `0x9114/15/16/28/29` are present (parser
-bug) or absent (need the same investigation for a different 5D2-specific
-opcode set).
+Got a real diagnostic report from a 5D Mark II over USB (see
+`docs/5d2-diagnostic-report-2026-09-16.txt`, 130 advertised operations,
+count verified against `advertisedCommandCount=130`).
+
+The camera advertises `0x9114`, `0x9115`, `0x9116`, `0x9128`, `0x9129`,
+`0x9154`, `0x9160`, `0x9153`, `0x9110`, `0x9157` — the *entire* Canon EOS
+vendor operation set assumed above. Manufacturer/model report as
+`Canon Inc. Canon EOS 5D Mark II`.
+
+But the report's `protocolVersions` line reads:
+
+```
+protocolVersions=PTP 1.00, vendor 0x00000006/200
+```
+
+`vendorExtensionId = 0x00000006` -- **not** `0x0000000B` (11), the value
+`CanonEosPtp.isCanonEos()` hardcoded as the only accepted Canon vendor
+extension ID. `0x00000006` is the PTP-registered Microsoft/MTP vendor
+extension ID; the 5D2 apparently self-reports MTP compatibility mode in
+this field even though every Canon vendor operation is present in the
+same `OperationsSupported` list.
+
+Since `isCanonEos()` gated `supportsRemotePreparation`,
+`supportsRemoteRelease`, `supportsAutofocus`, `supportsLiveView`, and
+every other Canon-specific capability check, this single hardcoded
+comparison was the root cause of every "not advertised" rejection --
+still capture, autofocus, live view, event polling, exposure control,
+etc. all cascade from it.
+
+This matches remoteyourcam-usb's own approach: it never reads the PTP
+`vendorExtensionId` field at all. It decides Canon-vs-Nikon purely from
+the **USB descriptor vendor ID** (`device.getVendorId() ==
+PtpConstants.CanonVendorId`, in `PtpUsbService.java`), which is exactly
+what open-eos-control's own `UsbPtpDiagnostics.kt` already does for the
+pre-connection USB scan (`isCanon = vendorId == CANON_USB_VENDOR_ID`).
+Only the later PTP-session-level `CanonEosPtp.isCanonEos()` check
+reinvented this using the unreliable PTP-level field instead.
+
+## Fix
+
+`android/app/src/main/java/dev/openeos/control/data/CanonEosPtp.kt`:
+
+```kotlin
+fun isCanonEos(info: PtpDeviceInfo): Boolean =
+    info.vendorExtensionId == VENDOR_EXTENSION_ID || info.manufacturer.contains("Canon", ignoreCase = true)
+```
+
+Keeps the original check (harmless for cameras that do report `0x0B`)
+and adds the manufacturer-string fallback, which the 5D2's DeviceInfo
+response already provides (`manufacturer = "Canon Inc."`). Still needs
+a real-camera rebuild/retest to confirm `STILL_CAPTURE` and friends
+move from `planned` to `supported`.
