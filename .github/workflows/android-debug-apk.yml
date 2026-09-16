@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - "android/**"
+      - "contracts/**"
       - ".github/workflows/android-debug-apk.yml"
   workflow_dispatch: {}
 
