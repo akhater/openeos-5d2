@@ -236,7 +236,7 @@ class CameraScreensTest {
         compose.onNodeWithContentDescription(resourceText(R.string.dismiss)).performScrollTo().performClick()
         compose.onNodeWithTag("capture-mode-VIDEO").performClick().assertIsSelected()
         compose.onNodeWithTag("capture-mode-PHOTO").performClick().assertIsSelected()
-        compose.onNodeWithTag("fps-control").performClick()
+        compose.onNodeWithTag("fps-control").performTouchInput { longClick() }
         compose.runOnIdle { assertEquals(SettingPicker.LIVE_VIEW, state.value.activeSettingPicker) }
     }
 
