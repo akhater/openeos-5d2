@@ -3,6 +3,7 @@ package dev.openeos.control.data
 import java.nio.charset.StandardCharsets
 
 object CanonEosOperationCode {
+    const val TAKE_PICTURE = 0x910F
     const val SET_DEVICE_PROP_VALUE_EX = 0x9110
     const val SET_REMOTE_MODE = 0x9114
     const val SET_EVENT_MODE = 0x9115
@@ -252,6 +253,9 @@ object CanonEosPtp {
         supportsRemotePreparation(info) &&
             info.supports(CanonEosOperationCode.REMOTE_RELEASE_ON) &&
             info.supports(CanonEosOperationCode.REMOTE_RELEASE_OFF)
+
+    fun supportsTakePicture(info: PtpDeviceInfo): Boolean =
+        supportsRemotePreparation(info) && info.supports(CanonEosOperationCode.TAKE_PICTURE)
 
     fun supportsAutofocus(info: PtpDeviceInfo): Boolean =
         supportsRemotePreparation(info) &&

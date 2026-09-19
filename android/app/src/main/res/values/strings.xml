@@ -26,6 +26,7 @@
     <string name="remote_live_view">Remote Live View</string>
     <string name="stop_remote_live_view">Stop remote Live View</string>
     <string name="live_view_paused">Live View paused</string>
+    <string name="enable_live_view">Enable Live View</string>
     <string name="app_name">Open EOS Control</string>
     <string name="connect_title">Connect your EOS</string>
     <string name="connect_subtitle">Connect directly, through a desktop bridge, or over USB.</string>

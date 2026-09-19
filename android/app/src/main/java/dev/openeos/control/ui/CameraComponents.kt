@@ -32,6 +32,8 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.CircularProgressIndicator
@@ -1074,12 +1076,29 @@ fun LiveViewFrame(state: CameraUiState, actions: CameraActions, modifier: Modifi
                     OfflinePreviewCopy(quarterTurn)
                 }
             }
-            !state.liveViewAutoRefresh -> Text(
-                stringResource(R.string.live_view_paused),
-                color = AppMutedText,
-                textAlign = TextAlign.Center,
-                modifier = Modifier.padding(24.dp).testTag("live-view-paused"),
-            )
+            !state.liveViewAutoRefresh -> Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp),
+                modifier = Modifier.testTag("live-view-paused"),
+            ) {
+                Text(
+                    stringResource(R.string.live_view_paused),
+                    color = AppMutedText,
+                    textAlign = TextAlign.Center,
+                )
+                if (state.supports(CameraFeature.LIVE_VIEW) && !state.isBusy(CameraOperation.LIVE_VIEW)) {
+                    Button(
+                        onClick = { actions.openPicker(SettingPicker.LIVE_VIEW) },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = AppSurfaceHigh,
+                            contentColor = AppText,
+                        ),
+                        shape = RoundedCornerShape(6.dp),
+                    ) {
+                        Text(stringResource(R.string.enable_live_view))
+                    }
+                }
+            }
             state.nativeLiveViewSession != null -> NativeRtpLiveView(
                 session = state.nativeLiveViewSession,
                 modifier = Modifier.fitLiveViewContent(displayAspectRatio),
@@ -1142,12 +1161,12 @@ fun LiveViewFrame(state: CameraUiState, actions: CameraActions, modifier: Modifi
             }
             }
 
-            Box(
-                Modifier
-                    .fillMaxSize()
-                    .pointerInput(canTap, tapAction, sourceAspectRatio) {
-                        detectTapGestures { offset ->
-                            if (canTap) {
+            if (canTap) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .pointerInput(tapAction, sourceAspectRatio) {
+                            detectTapGestures { offset ->
                                 mapLiveViewTap(
                                     tapX = offset.x,
                                     tapY = offset.y,
@@ -1163,8 +1182,8 @@ fun LiveViewFrame(state: CameraUiState, actions: CameraActions, modifier: Modifi
                                 }
                             }
                         }
-                    }
-            )
+                )
+            }
 
             if (state.status?.recording == true) {
                 RecordingIndicator(Modifier.align(Alignment.CenterStart).padding(12.dp))

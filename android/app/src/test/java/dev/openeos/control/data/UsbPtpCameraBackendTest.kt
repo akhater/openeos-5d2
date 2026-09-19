@@ -923,6 +923,23 @@ class UsbPtpCameraBackendTest {
     }
 
     @Test
+    fun canonDedicatedTakePictureCommandIsPreferredOverRemoteRelease() = runTest {
+        val transport = CanonEosScriptedTransport(advertiseCanonTakePicture = true)
+        val backend = UsbPtpCameraBackend(
+            connection = CameraConnection.AndroidUsbPtp("usb-5d2"),
+            transportFactory = PtpTransportFactory { transport },
+        )
+        backend.initialize()
+
+        backend.captureStill()
+
+        assertTrue(transport.hasOperation(CanonEosOperationCode.TAKE_PICTURE))
+        assertFalse(transport.hasOperation(CanonEosOperationCode.REMOTE_RELEASE_ON))
+        assertTrue(CameraFeature.STILL_CAPTURE in backend.observedFeatures())
+        backend.close()
+    }
+
+    @Test
     fun canonAppCaptureOwnsObjectEventsWhileBackgroundPollingIsActive() = runTest {
         val transport = CanonEosScriptedTransport(delayAfterFullReleaseMillis = 100L)
         val backend = UsbPtpCameraBackend(
@@ -3047,6 +3064,7 @@ class UsbPtpCameraBackendTest {
         private val captureDestination: Int = 2,
         private val advertiseCardCaptureDestination: Boolean = true,
         private val advertiseDedicatedAutofocus: Boolean = true,
+        private val advertiseCanonTakePicture: Boolean = false,
         private val advertiseRemoteRelease: Boolean = true,
         private val advertiseLiveViewMagnification: Boolean = true,
         private val advertiseTouchAutofocus: Boolean = false,
@@ -3130,6 +3148,11 @@ class UsbPtpCameraBackendTest {
                     response(PtpResponseCode.GENERAL_ERROR, transaction)
                 } else {
                     ok(transaction)
+                }
+
+                CanonEosOperationCode.TAKE_PICTURE -> {
+                    captureEventPending = true
+                    incoming += ok(transaction)
                 }
 
                 CanonEosOperationCode.MOVIE_SELECT_SWITCH_ON,
@@ -3774,6 +3797,7 @@ class UsbPtpCameraBackendTest {
                     if (advertisePropertyWrites) add(CanonEosOperationCode.SET_DEVICE_PROP_VALUE_EX)
                     if (advertiseTextMetadata) add(CanonEosOperationCode.REQUEST_DEVICE_PROP_VALUE)
                     if (advertiseEventPolling) add(CanonEosOperationCode.GET_EVENT)
+                    if (advertiseCanonTakePicture) add(CanonEosOperationCode.TAKE_PICTURE)
                     if (advertiseRemoteRelease) {
                         add(CanonEosOperationCode.REMOTE_RELEASE_ON)
                         add(CanonEosOperationCode.REMOTE_RELEASE_OFF)

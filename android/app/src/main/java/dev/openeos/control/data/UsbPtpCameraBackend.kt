@@ -219,6 +219,7 @@ class UsbPtpCameraBackend(
             canSetStandardProperties = canSetProperties,
             canSetCanonProperties = CanonEosPtp.supportsPropertyControl(info),
         )
+        val supportsCanonTakePicture = CanonEosPtp.supportsTakePicture(info)
         val supportsCanonRelease = CanonEosPtp.supportsRemoteRelease(info)
         val supportsCanonEvents = CanonEosPtp.supportsRemotePreparation(info)
         val supportsCanonAutofocus = CanonEosPtp.supportsAutofocus(info)
@@ -257,7 +258,7 @@ class UsbPtpCameraBackend(
                 add(CameraFeature.MEDIA_PROTECT)
             }
             if (supportsMtpMediaRating) add(CameraFeature.MEDIA_RATING)
-            if (info.supports(PtpOperationCode.INITIATE_CAPTURE) || supportsCanonRelease) {
+            if (info.supports(PtpOperationCode.INITIATE_CAPTURE) || supportsCanonTakePicture || supportsCanonRelease) {
                 add(CameraFeature.STILL_CAPTURE)
             }
             if (supportsCanonRelease) {
@@ -494,6 +495,22 @@ class UsbPtpCameraBackend(
 
     override suspend fun captureStill(): CameraStatus {
         val info = requireDeviceInfo()
+        if (CanonEosPtp.supportsTakePicture(info)) {
+            ensureCanonRemoteMode()
+            val ptp = requireSession()
+            canonEventMutex.withLock {
+                drainCanonEventsLocked()
+                val hostTransferPrepared = prepareCanonCaptureDestination()
+                // The 5D Mark II advertises Canon's dedicated still-capture
+                // operation (0x910F). Prefer it over the two-stage remote
+                // release sequence; the latter can leave the shutter held on
+                // older EOS bodies.
+                ptp.executeOperation(CanonEosOperationCode.TAKE_PICTURE)
+                awaitCanonCapturedObjectLocked(hostTransferPrepared)
+            }
+            observedFeatures.add(CameraFeature.STILL_CAPTURE)
+            return status()
+        }
         if (!CanonEosPtp.supportsRemoteRelease(info) && info.supports(PtpOperationCode.INITIATE_CAPTURE)) {
             requireSession().initiateCapture()
             observedFeatures.add(CameraFeature.STILL_CAPTURE)
