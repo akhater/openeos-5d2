@@ -2323,11 +2323,20 @@ class CameraViewModel(
             )
         }
         return viewModelScope.launch {
+            val pauseLiveView = operation in LIVE_VIEW_INTERLOCK_OPERATIONS &&
+                _uiState.value.transport == CameraTransport.USB_PTP &&
+                _uiState.value.connected && !_uiState.value.previewMode &&
+                repository.isLiveViewRunning()
+            var liveViewPauseAttempted = false
             val pauseEventPolling = operation in EVENT_POLLING_INTERLOCK_OPERATIONS &&
                 _uiState.value.connected && !_uiState.value.previewMode
-            if (pauseEventPolling) stopEventPollingLoopAndJoin()
             var operationSucceeded = false
             try {
+                if (pauseEventPolling) stopEventPollingLoopAndJoin()
+                if (pauseLiveView) {
+                    liveViewPauseAttempted = true
+                    pauseUsbLiveViewForCameraOperation()
+                }
                 block()
                 operationSucceeded = true
                 if (operation in CAPABILITY_EVIDENCE_OPERATIONS) {
@@ -2356,12 +2365,51 @@ class CameraViewModel(
                     }
                 }
                 afterFinally()
+                if (liveViewPauseAttempted && _uiState.value.connected && !_uiState.value.previewMode) {
+                    // Re-establish the EVF session before Canon event traffic resumes.
+                    try {
+                        reconcileLiveView(restart = true)
+                    } catch (exception: CancellationException) {
+                        throw exception
+                    } catch (exception: Exception) {
+                        _uiState.update {
+                            if (it.connected) it.copy(
+                                error = formatException(exception),
+                                errorOperation = CameraOperation.LIVE_VIEW,
+                            ) else it
+                        }
+                    }
+                }
                 if (pauseEventPolling && operationSucceeded && _uiState.value.connected && !_uiState.value.previewMode) {
                     // Keep Canon's event-check traffic out of the next camera command.
                     startEventPollingIfSupported()
                 }
-                if (operation in LIVE_VIEW_INTERLOCK_OPERATIONS) queueLiveViewReconciliation()
+                if (operation in LIVE_VIEW_INTERLOCK_OPERATIONS && !liveViewPauseAttempted) {
+                    queueLiveViewReconciliation()
+                }
             }
+        }
+    }
+
+    /**
+     * The EOS 5D Mark II is not reliable when a Live View frame request overlaps
+     * a setting/capture command. Stop the frame loop and the camera-side EVF
+     * session as one transition; the operation finally block starts it again.
+     */
+    private suspend fun pauseUsbLiveViewForCameraOperation() = liveViewTransitionMutex.withLock {
+        if (!repository.isLiveViewRunning()) return@withLock
+        liveViewGeneration += 1
+        stopLiveViewLoopAndJoin()
+        repository.setNativeLiveViewRenderingEnabled(false)
+        repository.setLiveViewEnabled(false)
+        _uiState.update {
+            it.copy(
+                liveViewBitmap = null,
+                liveViewFrameUrl = null,
+                nativeLiveViewSession = null,
+                liveViewDiagnostics = LiveViewDiagnostics(),
+                liveViewAudioStatus = NativeLiveViewAudioStatus.None,
+            )
         }
     }
 
@@ -2596,6 +2644,12 @@ class CameraViewModel(
     private fun stopLiveViewLoop() {
         liveViewJob?.cancel()
         liveViewJob = null
+    }
+
+    private suspend fun stopLiveViewLoopAndJoin() {
+        val job = liveViewJob
+        liveViewJob = null
+        job?.cancelAndJoin()
     }
 
     private fun startEventPollingIfSupported() {

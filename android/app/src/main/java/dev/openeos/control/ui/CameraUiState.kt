@@ -204,7 +204,12 @@ internal fun CameraUiState.canStartHeldAutofocus(): Boolean = connected && !prev
     !isBusy(CameraOperation.LIVE_VIEW) && HELD_AF_INTERLOCK_OPERATIONS.none { isBusy(it) }
 
 internal val LIVE_VIEW_INTERLOCK_OPERATIONS = setOf(
-    CameraOperation.FOCUS, CameraOperation.CAPTURE, CameraOperation.RECORDING, CameraOperation.MAINTENANCE,
+    CameraOperation.FOCUS,
+    CameraOperation.CAPTURE,
+    CameraOperation.RECORDING,
+    CameraOperation.SETTING,
+    CameraOperation.CLOCK,
+    CameraOperation.MAINTENANCE,
 )
 
 data class FocusPoint(

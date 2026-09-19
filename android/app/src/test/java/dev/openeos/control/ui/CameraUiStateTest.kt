@@ -54,6 +54,12 @@ class CameraUiStateTest {
     }
 
     @Test
+    fun liveViewInterlockIncludesSettingsAndClockWrites() {
+        assertTrue(CameraOperation.SETTING in LIVE_VIEW_INTERLOCK_OPERATIONS)
+        assertTrue(CameraOperation.CLOCK in LIVE_VIEW_INTERLOCK_OPERATIONS)
+    }
+
+    @Test
     fun captureModeSwitchIsBlockedDuringRecordingBulbAndCaptureWrites() {
         val status = CameraStatus(
             connected = true,
