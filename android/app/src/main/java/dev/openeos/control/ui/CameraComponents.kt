@@ -934,11 +934,10 @@ fun LiveViewFrame(state: CameraUiState, actions: CameraActions, modifier: Modifi
     val sourceAspectRatio = decodedFrame?.takeIf { it.width > 0 && it.height > 0 }
         ?.let { it.width.toFloat() / it.height.toFloat() } ?: state.liveViewAspectRatio
     val displayAspectRatio = sourceAspectRatio * state.monitorSettings.desqueeze.horizontalScale
-    val focusAvailable = state.supports(CameraFeature.TAP_FOCUS) || state.supports(CameraFeature.AUTOFOCUS)
     val tapAction = when {
         state.liveViewTapAction == LiveViewTapAction.WHITE_BALANCE &&
             state.supports(CameraFeature.CLICK_WHITE_BALANCE) -> LiveViewTapAction.WHITE_BALANCE
-        focusAvailable -> LiveViewTapAction.FOCUS
+        state.supports(CameraFeature.TAP_FOCUS) -> LiveViewTapAction.FOCUS
         state.supports(CameraFeature.CLICK_WHITE_BALANCE) -> LiveViewTapAction.WHITE_BALANCE
         else -> null
     }
@@ -1219,13 +1218,14 @@ fun LiveViewFrame(state: CameraUiState, actions: CameraActions, modifier: Modifi
                 Box(Modifier.fillMaxSize().background(Color.White.copy(alpha = 0.72f)))
             }
         }
-        if (state.supports(CameraFeature.CLICK_WHITE_BALANCE) && focusAvailable) {
+        if (state.supports(CameraFeature.CLICK_WHITE_BALANCE)) {
             val bottomPadding = liveViewOverlayBottomPadding(state)
+            val focusAvailable = state.supports(CameraFeature.TAP_FOCUS)
             val description = stringResource(
-                when {
-                    tapAction == LiveViewTapAction.WHITE_BALANCE -> R.string.tap_action_white_balance
-                    state.supports(CameraFeature.TAP_FOCUS) -> R.string.tap_action_focus
-                    else -> R.string.tap_action_autofocus
+                if (tapAction == LiveViewTapAction.WHITE_BALANCE) {
+                    R.string.tap_action_white_balance
+                } else {
+                    R.string.tap_action_focus
                 }
             )
             ToolIconButton(
