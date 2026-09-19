@@ -468,6 +468,7 @@
     <string name="manual_focus_drive_hint">Move lens focus in one of three relative step sizes.</string>
     <string name="live_view_tap_action">Live View tap action</string>
     <string name="tap_action_focus">Select AF point</string>
+    <string name="tap_action_autofocus">Autofocus at the camera-selected AF point</string>
     <string name="tap_action_white_balance">Click white balance</string>
     <string name="focus_nearer">Near</string>
     <string name="focus_farther">Far</string>

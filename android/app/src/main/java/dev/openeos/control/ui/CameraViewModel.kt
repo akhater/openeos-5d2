@@ -2189,6 +2189,14 @@ class CameraViewModel(
 
     fun tapFocus(x: Double, y: Double) {
         if (_uiState.value.isBusy(CameraOperation.FOCUS) || _uiState.value.isBusy(CameraOperation.LIVE_VIEW)) return
+        if (
+            !_uiState.value.supports(CameraFeature.TAP_FOCUS) &&
+            _uiState.value.supports(CameraFeature.AUTOFOCUS)
+        ) {
+            _uiState.update { it.copy(focusPoint = FocusPoint(x, y)) }
+            autofocus()
+            return
+        }
         invalidateCameraFocusInfo()
         focusFeedbackJob?.cancel()
         _uiState.update {
@@ -2227,11 +2235,12 @@ class CameraViewModel(
     }
 
     fun setLiveViewTapAction(action: LiveViewTapAction) {
-        val feature = when (action) {
-            LiveViewTapAction.FOCUS -> CameraFeature.TAP_FOCUS
-            LiveViewTapAction.WHITE_BALANCE -> CameraFeature.CLICK_WHITE_BALANCE
+        val supported = when (action) {
+            LiveViewTapAction.FOCUS -> _uiState.value.supports(CameraFeature.TAP_FOCUS) ||
+                _uiState.value.supports(CameraFeature.AUTOFOCUS)
+            LiveViewTapAction.WHITE_BALANCE -> _uiState.value.supports(CameraFeature.CLICK_WHITE_BALANCE)
         }
-        if (_uiState.value.previewMode || _uiState.value.supports(feature)) {
+        if (_uiState.value.previewMode || supported) {
             _uiState.update { it.copy(liveViewTapAction = action) }
         }
     }

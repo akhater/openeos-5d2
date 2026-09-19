@@ -1337,7 +1337,10 @@ private fun MoreSettingsSheet(state: CameraUiState, actions: CameraActions) {
                             enabled = state.canChangeShutterAutofocus())
                     }
                 }
-                if (state.supports(CameraFeature.CLICK_WHITE_BALANCE)) {
+                if (
+                    state.supports(CameraFeature.CLICK_WHITE_BALANCE) &&
+                    (state.supports(CameraFeature.TAP_FOCUS) || state.supports(CameraFeature.AUTOFOCUS))
+                ) {
                     LiveViewTapActionControls(state, actions)
                 }
                 if (state.supports(CameraFeature.AUTOFOCUS)) {
@@ -1768,12 +1771,20 @@ private fun SettingsSheetTitle(title: String, onDismiss: () -> Unit) {
 
 @Composable
 private fun LiveViewTapActionControls(state: CameraUiState, actions: CameraActions) {
+    val focusAvailable = state.supports(CameraFeature.TAP_FOCUS) || state.supports(CameraFeature.AUTOFOCUS)
     val selectedAction = when {
         state.liveViewTapAction == LiveViewTapAction.WHITE_BALANCE &&
             state.supports(CameraFeature.CLICK_WHITE_BALANCE) -> LiveViewTapAction.WHITE_BALANCE
-        state.supports(CameraFeature.TAP_FOCUS) -> LiveViewTapAction.FOCUS
+        focusAvailable -> LiveViewTapAction.FOCUS
         else -> LiveViewTapAction.WHITE_BALANCE
     }
+    val focusLabel = stringResource(
+        if (state.supports(CameraFeature.TAP_FOCUS)) {
+            R.string.tap_action_focus
+        } else {
+            R.string.tap_action_autofocus
+        }
+    )
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Text(stringResource(R.string.live_view_tap_action), color = AppText, fontWeight = FontWeight.SemiBold)
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1790,7 +1801,7 @@ private fun LiveViewTapActionControls(state: CameraUiState, actions: CameraActio
                     Icon(painterResource(LucideR.drawable.lucide_ic_focus), null, Modifier.size(18.dp))
                     Spacer(Modifier.width(8.dp))
                     Text(
-                        stringResource(R.string.tap_action_focus),
+                        focusLabel,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                         textAlign = TextAlign.Center,
