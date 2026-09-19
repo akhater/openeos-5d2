@@ -688,18 +688,14 @@ class UsbPtpCameraBackend(
             throw PtpProtocolException("Canon EOS Live View magnification requires an active Live View session.")
         }
         canonEventMutex.withLock {
-            withCanonDeviceBusyRetry {
-                requireSession().executeOperation(
-                    CanonEosOperationCode.ZOOM,
-                    listOf(magnification.value.toLong()),
-                )
-            }
+            requireSession().executeOperation(
+                CanonEosOperationCode.ZOOM,
+                listOf(magnification.value.toLong()),
+            )
             // The command is followed by a property/event update on older EOS bodies.
             // Consume it before the next Live View frame request so the response cannot
             // be mistaken for the frame transaction.
-            drainCanonEventsRetryingLocked(
-                System.currentTimeMillis() + CANON_LIVE_VIEW_READY_TIMEOUT_MILLIS,
-            )
+            drainCanonEventsLocked()
         }
         observedFeatures.add(CameraFeature.LIVE_VIEW_MAGNIFICATION)
         return LiveViewMagnificationResult(ok = true, magnification = magnification)
@@ -1142,58 +1138,44 @@ class UsbPtpCameraBackend(
     }
 
     override suspend fun startLiveView(request: LiveViewRequest) {
-        canonEventMutex.withLock {
-            if (!CanonEosPtp.supportsLiveView(requireDeviceInfo())) unsupported<Unit>(CameraFeature.LIVE_VIEW)
-            if (canonLiveViewActive) return@withLock
-            canonLiveViewGeometry = null
-            ensureCanonRemoteModeLocked()
-            val ptp = requireSession()
-            withCanonDeviceBusyRetry {
+        if (!CanonEosPtp.supportsLiveView(requireDeviceInfo())) unsupported<Unit>(CameraFeature.LIVE_VIEW)
+        if (canonLiveViewActive) return
+        canonLiveViewGeometry = null
+        ensureCanonRemoteMode()
+        val ptp = requireSession()
+        ptp.executeDataOutOperation(
+            operationCode = CanonEosOperationCode.SET_DEVICE_PROP_VALUE_EX,
+            payload = CanonEosPtp.uint16PropertyPayload(CanonEosPropertyCode.EVF_MODE, 1),
+        )
+        try {
+            ptp.executeDataOutOperation(
+                operationCode = CanonEosOperationCode.SET_DEVICE_PROP_VALUE_EX,
+                payload = CanonEosPtp.uint32PropertyPayload(CanonEosPropertyCode.EVF_OUTPUT_DEVICE, 2L),
+            )
+            canonLiveViewActive = true
+            drainCanonEvents()
+            observedFeatures.add(CameraFeature.LIVE_VIEW)
+        } catch (exception: Exception) {
+            runCatching {
                 ptp.executeDataOutOperation(
                     operationCode = CanonEosOperationCode.SET_DEVICE_PROP_VALUE_EX,
-                    payload = CanonEosPtp.uint16PropertyPayload(CanonEosPropertyCode.EVF_MODE, 1),
+                    payload = CanonEosPtp.uint32PropertyPayload(CanonEosPropertyCode.EVF_OUTPUT_DEVICE, 0L),
                 )
             }
-            try {
-                withCanonDeviceBusyRetry {
-                    ptp.executeDataOutOperation(
-                        operationCode = CanonEosOperationCode.SET_DEVICE_PROP_VALUE_EX,
-                        payload = CanonEosPtp.uint32PropertyPayload(CanonEosPropertyCode.EVF_OUTPUT_DEVICE, 2L),
-                    )
-                }
-                canonLiveViewActive = true
-                drainCanonEventsRetryingLocked(
-                    System.currentTimeMillis() + CANON_LIVE_VIEW_READY_TIMEOUT_MILLIS,
-                )
-                observedFeatures.add(CameraFeature.LIVE_VIEW)
-            } catch (exception: Exception) {
-                runCatching {
-                    withCanonDeviceBusyRetry {
-                        ptp.executeDataOutOperation(
-                            operationCode = CanonEosOperationCode.SET_DEVICE_PROP_VALUE_EX,
-                            payload = CanonEosPtp.uint32PropertyPayload(CanonEosPropertyCode.EVF_OUTPUT_DEVICE, 0L),
-                        )
-                    }
-                }
-                throw exception
-            }
+            throw exception
         }
     }
 
     override suspend fun stopLiveView() {
-        canonEventMutex.withLock {
-            if (!canonLiveViewActive) return@withLock
-            try {
-                withCanonDeviceBusyRetry {
-                    requireSession().executeDataOutOperation(
-                        operationCode = CanonEosOperationCode.SET_DEVICE_PROP_VALUE_EX,
-                        payload = CanonEosPtp.uint32PropertyPayload(CanonEosPropertyCode.EVF_OUTPUT_DEVICE, 0L),
-                    )
-                }
-            } finally {
-                canonLiveViewActive = false
-                canonLiveViewGeometry = null
-            }
+        if (!canonLiveViewActive) return
+        try {
+            requireSession().executeDataOutOperation(
+                operationCode = CanonEosOperationCode.SET_DEVICE_PROP_VALUE_EX,
+                payload = CanonEosPtp.uint32PropertyPayload(CanonEosPropertyCode.EVF_OUTPUT_DEVICE, 0L),
+            )
+        } finally {
+            canonLiveViewActive = false
+            canonLiveViewGeometry = null
         }
     }
 
@@ -1302,14 +1284,11 @@ class UsbPtpCameraBackend(
     private suspend fun drainCanonEventsLocked(): ByteArray =
         requireSession().executeDataInOperation(CanonEosOperationCode.GET_EVENT).also(::applyCanonPropertyUpdates)
 
-    private suspend fun <T> withCanonDeviceBusyRetry(
-        deadlineMillis: Long = System.currentTimeMillis() + CANON_LIVE_VIEW_READY_TIMEOUT_MILLIS,
-        action: suspend () -> T,
-    ): T {
+    private suspend fun drainCanonEventsRetryingLocked(deadlineMillis: Long): ByteArray {
         var retryDelay = 25L
         while (true) {
             try {
-                return action()
+                return drainCanonEventsLocked()
             } catch (exception: PtpResponseException) {
                 if (
                     exception.responseCode != PtpResponseCode.DEVICE_BUSY ||
@@ -1323,15 +1302,23 @@ class UsbPtpCameraBackend(
         }
     }
 
-    private suspend fun drainCanonEventsRetryingLocked(deadlineMillis: Long): ByteArray {
-        return withCanonDeviceBusyRetry(deadlineMillis) { drainCanonEventsLocked() }
-    }
-
     private suspend fun executeCanonTakePictureWithRetry(ptp: PtpSession) {
-        withCanonDeviceBusyRetry(
-            deadlineMillis = System.currentTimeMillis() + CANON_CAPTURE_READY_TIMEOUT_MILLIS,
-        ) {
-            ptp.executeOperation(CanonEosOperationCode.TAKE_PICTURE)
+        val deadline = System.currentTimeMillis() + CANON_CAPTURE_READY_TIMEOUT_MILLIS
+        var retryDelay = 50L
+        while (true) {
+            try {
+                ptp.executeOperation(CanonEosOperationCode.TAKE_PICTURE)
+                return
+            } catch (exception: PtpResponseException) {
+                if (
+                    exception.responseCode != PtpResponseCode.DEVICE_BUSY ||
+                    System.currentTimeMillis() >= deadline
+                ) {
+                    throw exception
+                }
+                delay(retryDelay)
+                retryDelay = (retryDelay + 50L).coerceAtMost(250L)
+            }
         }
     }
 

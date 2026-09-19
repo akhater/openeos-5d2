@@ -840,10 +840,7 @@ class CameraViewModel(
         _uiState.update { it.copy(pendingOperations = it.pendingOperations + CameraOperation.LIVE_VIEW) }
         try {
             liveViewGeneration += 1
-            // The frame request is a real USB/PTP operation.  Cancelling the
-            // coroutine without joining can leave that request in flight while
-            // the next enable/disable command is sent to the 5D Mark II.
-            stopLiveViewLoopAndJoin()
+            stopLiveViewLoop()
             detachNativeLiveViewListener()
             _uiState.update {
                 it.copy(liveViewBitmap = null, liveViewFrameUrl = null, nativeLiveViewSession = null,
@@ -1331,20 +1328,17 @@ class CameraViewModel(
         }
         val job = viewModelScope.launch {
             try {
-                val (items, capabilities) = withUsbLiveViewFramesPaused {
-                    val loadedItems = repository.listMedia(maximumItemsFor(scope)) { partialItems ->
+                val items = withUsbLiveViewFramesPaused {
+                    repository.listMedia(maximumItemsFor(scope)) { partialItems ->
                         if (generation == mediaLibraryGeneration) {
                             val batch = partialItems.toMediaLibraryBatch(scope)
                             applyMediaItems(batch.items, batch.hasMore)
                         }
                     }
-                    // Keep the capability read inside the same USB critical
-                    // section.  The Canon event loop is restarted only after
-                    // both reads have completed.
-                    loadedItems to runCatching { repository.refreshCapabilities() }.getOrNull()
                 }
                 if (generation != mediaLibraryGeneration) return@launch
                 val batch = items.toMediaLibraryBatch(scope)
+                val capabilities = runCatching { repository.refreshCapabilities() }.getOrNull()
                 if (generation != mediaLibraryGeneration) return@launch
                 _uiState.update {
                     it.copy(
@@ -2367,11 +2361,9 @@ class CameraViewModel(
                 afterFinally()
                 if (liveViewFramePauseAttempted && _uiState.value.connected && !_uiState.value.previewMode) {
                     // The camera's Live View session stays active; only frame requests are resumed.
-                    liveViewTransitionMutex.withLock {
-                        delay(LIVE_VIEW_RESUME_DELAY_MILLIS)
-                        startLiveViewLoopIfNeeded()
-                        startCameraFocusInfoLoop()
-                    }
+                    delay(LIVE_VIEW_RESUME_DELAY_MILLIS)
+                    startLiveViewLoopIfNeeded()
+                    startCameraFocusInfoLoop()
                 }
                 if (pauseEventPolling && _uiState.value.connected && !_uiState.value.previewMode) {
                     // Keep Canon's event-check traffic out of the next camera command.
@@ -2399,55 +2391,28 @@ class CameraViewModel(
         // A capture/setting/zoom operation owns the camera until its pending flag is cleared.
         // Capture-review jobs can be launched from inside those operations, so wait here rather
         // than letting a media request run beside the command that created it.
-        while (_uiState.value.pendingOperations.isNotEmpty()) {
+        while (_uiState.value.pendingOperations.any { it != CameraOperation.MEDIA }) {
             delay(25L)
         }
         val state = _uiState.value
-        if (
-            state.transport != CameraTransport.USB_PTP ||
-            !state.connected ||
-            state.previewMode
-        ) return block()
+        val shouldPause = state.transport == CameraTransport.USB_PTP &&
+            state.connected && !state.previewMode && repository.isLiveViewRunning()
+        // A MEDIA operation already paused the frame loop in launchCameraOperation.
+        // Do not restart it from a nested capture-review/media refresh while that
+        // operation still owns the camera.
+        if (!shouldPause || liveViewJob?.isActive != true) return block()
 
-        // A direct media refresh is not launched through launchCameraOperation, so it
-        // must also keep Canon's event loop out of the PTP stream.  Do not cancel the
-        // event loop when this helper is called by that loop itself.
-        val eventPollingOwner = eventPollingJob == coroutineContext[Job]
-        val pauseEventPolling = !eventPollingOwner
-        val pauseLiveViewFrames = repository.isLiveViewRunning()
-
-        // Stop this before taking the frame mutex.  The event loop itself can
-        // enter this helper for a contents event; joining it while holding the
-        // mutex would deadlock that loop behind us.
-        if (pauseEventPolling) stopEventPollingLoopAndJoin()
         return liveViewTransitionMutex.withLock {
-            if (pauseLiveViewFrames) {
-                liveViewGeneration += 1
-                // Stop even when the frame job is already paused.  The mutex also
-                // protects the gap before another operation resumes it.
-                stopLiveViewLoopAndJoin()
-                stopCameraFocusInfoLoopAndJoin()
-            }
+            liveViewGeneration += 1
+            stopLiveViewLoopAndJoin()
+            stopCameraFocusInfoLoopAndJoin()
             try {
                 block()
             } finally {
-                if (
-                    pauseLiveViewFrames &&
-                    _uiState.value.connected &&
-                    !_uiState.value.previewMode &&
-                    repository.isLiveViewRunning()
-                ) {
+                if (_uiState.value.connected && !_uiState.value.previewMode && repository.isLiveViewRunning()) {
                     delay(LIVE_VIEW_RESUME_DELAY_MILLIS)
                     startLiveViewLoopIfNeeded()
                     startCameraFocusInfoLoop()
-                }
-                if (
-                    pauseEventPolling &&
-                    _uiState.value.connected &&
-                    !_uiState.value.previewMode &&
-                    !repository.isLiveViewRunning()
-                ) {
-                    startEventPollingIfSupported()
                 }
             }
         }

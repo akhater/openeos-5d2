@@ -962,30 +962,6 @@ class UsbPtpCameraBackendTest {
     }
 
     @Test
-    fun canonLiveViewCanRestartAndCycleMagnification() = runTest {
-        val transport = CanonEosScriptedTransport(
-            advertiseLiveViewMagnification = true,
-            busyZoomResponses = 2,
-        )
-        val backend = UsbPtpCameraBackend(
-            connection = CameraConnection.AndroidUsbPtp("usb-5d2-live-view-restart"),
-            transportFactory = PtpTransportFactory { transport },
-        )
-        backend.initialize()
-
-        backend.startLiveView(LiveViewRequest(fps = 30, size = LiveViewSize.MEDIUM))
-        backend.setLiveViewMagnification(LiveViewMagnification.X5)
-        backend.setLiveViewMagnification(LiveViewMagnification.X1)
-        backend.stopLiveView()
-        backend.startLiveView(LiveViewRequest(fps = 30, size = LiveViewSize.MEDIUM))
-        backend.setLiveViewMagnification(LiveViewMagnification.X5)
-
-        assertTrue(transport.hasOperation(CanonEosOperationCode.ZOOM))
-        backend.stopLiveView()
-        backend.close()
-    }
-
-    @Test
     fun canonAppCaptureOwnsObjectEventsWhileBackgroundPollingIsActive() = runTest {
         val transport = CanonEosScriptedTransport(delayAfterFullReleaseMillis = 100L)
         val backend = UsbPtpCameraBackend(
@@ -3125,7 +3101,6 @@ class UsbPtpCameraBackendTest {
         private val rejectPartialAtOffset: Long? = null,
         private val delayAfterFullReleaseMillis: Long = 0L,
         private val busyCaptureEventResponsesAfterCapture: Int = 0,
-        private val busyZoomResponses: Int = 0,
         private val currentStorageId: Long? = null,
         private val storageDevices: MutableList<StorageFixture> = mutableListOf(defaultStorageFixture()),
         private val advertisedClockProperty: Int? = CanonEosPropertyCode.UTC_TIME,
@@ -3139,7 +3114,6 @@ class UsbPtpCameraBackendTest {
         private var pendingPropertyWrite = false
         private var captureEventPending = false
         private var captureEventBusyResponsesRemaining = busyCaptureEventResponsesAfterCapture
-        private var zoomBusyResponsesRemaining = busyZoomResponses
         private var fullPressActive = false
         private var initialPropertyEventsPending = true
         private var moviePropertyEventPending: Int? = null
@@ -3194,13 +3168,10 @@ class UsbPtpCameraBackendTest {
                 CanonEosOperationCode.CLICK_WHITE_BALANCE,
                 CanonEosOperationCode.TRANSFER_COMPLETE,
                 CanonEosOperationCode.PC_HDD_CAPACITY,
-                -> incoming += when {
-                    container.code == rejectOperationCode -> response(PtpResponseCode.GENERAL_ERROR, transaction)
-                    container.code == CanonEosOperationCode.ZOOM && zoomBusyResponsesRemaining > 0 -> {
-                        zoomBusyResponsesRemaining -= 1
-                        response(PtpResponseCode.DEVICE_BUSY, transaction)
-                    }
-                    else -> ok(transaction)
+                -> incoming += if (container.code == rejectOperationCode) {
+                    response(PtpResponseCode.GENERAL_ERROR, transaction)
+                } else {
+                    ok(transaction)
                 }
 
                 CanonEosOperationCode.TAKE_PICTURE -> {
