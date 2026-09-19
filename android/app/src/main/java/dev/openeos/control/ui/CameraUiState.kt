@@ -183,7 +183,7 @@ data class CameraUiState(
             (CameraOperation.FOCUS in pendingOperations && operation in HELD_AF_INTERLOCK_OPERATIONS) ||
             (operation == CameraOperation.FOCUS && HELD_AF_INTERLOCK_OPERATIONS.any { it in pendingOperations }) ||
             (autofocusHoldState != AutofocusHoldState.IDLE && operation in HELD_AF_INTERLOCK_OPERATIONS) ||
-            (CameraOperation.LIVE_VIEW in pendingOperations && operation in LIVE_VIEW_INTERLOCK_OPERATIONS)
+            (CameraOperation.LIVE_VIEW in pendingOperations && operation in LIVE_VIEW_UI_INTERLOCK_OPERATIONS)
 }
 
 internal val HELD_AF_INTERLOCK_OPERATIONS = setOf(
@@ -213,6 +213,10 @@ internal val LIVE_VIEW_INTERLOCK_OPERATIONS = setOf(
     CameraOperation.MAINTENANCE,
     CameraOperation.POWER,
 )
+
+// Media access still needs the USB transition barrier, but it should remain
+// available while the Live View toggle itself is being reconciled.
+internal val LIVE_VIEW_UI_INTERLOCK_OPERATIONS = LIVE_VIEW_INTERLOCK_OPERATIONS - CameraOperation.MEDIA
 
 data class FocusPoint(
     val x: Double,
