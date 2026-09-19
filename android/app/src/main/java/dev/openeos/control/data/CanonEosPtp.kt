@@ -20,6 +20,7 @@ object CanonEosOperationCode {
     const val DRIVE_LENS = 0x9155
     const val CLICK_WHITE_BALANCE = 0x9157
     const val ZOOM = 0x9158
+    const val SET_LIVE_AF_FRAME = 0x915A
     const val TOUCH_AF_POSITION = 0x915B
     const val AF_CANCEL = 0x9160
 }
@@ -283,6 +284,14 @@ object CanonEosPtp {
         supportsLiveView(info) &&
             info.supports(CanonEosOperationCode.TOUCH_AF_POSITION) &&
             (supportsAutofocus(info) || supportsRemoteRelease(info))
+
+    fun supportsLiveViewAfFrame(info: PtpDeviceInfo): Boolean =
+        supportsLiveView(info) &&
+            info.supports(CanonEosOperationCode.SET_LIVE_AF_FRAME) &&
+            supportsAutofocus(info)
+
+    fun supportsLiveViewTapAutofocus(info: PtpDeviceInfo): Boolean =
+        supportsTouchAutofocus(info) || supportsLiveViewAfFrame(info)
 
     fun supportsClickWhiteBalance(info: PtpDeviceInfo): Boolean =
         supportsLiveView(info) && info.supports(CanonEosOperationCode.CLICK_WHITE_BALANCE)
