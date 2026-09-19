@@ -710,6 +710,8 @@ private fun ExposureDial(
 private fun LiveViewSettingsSheet(state: CameraUiState, actions: CameraActions) {
     val minFps = state.capabilities?.liveView?.minFps ?: MIN_LIVE_VIEW_FPS
     val maxFps = state.capabilities?.liveView?.maxFps ?: MAX_LIVE_VIEW_FPS
+    val exposureSimulation = state.capabilities?.advancedSettings
+        ?.firstOrNull { it.key == "exposuresimulation" }
     var pendingFps by remember(state.liveViewFrameRateFps) {
         mutableFloatStateOf(state.liveViewFrameRateFps.toFloat())
     }
@@ -728,6 +730,30 @@ private fun LiveViewSettingsSheet(state: CameraUiState, actions: CameraActions) 
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(stringResource(R.string.remote_live_view), color = AppText, modifier = Modifier.weight(1f))
                     Switch(state.liveViewAutoRefresh, actions.setAutoRefresh)
+                }
+                exposureSimulation?.let { setting ->
+                    val enabled = setting.value.equals("On", ignoreCase = true)
+                    val onValue = setting.values.firstOrNull { it.equals("On", ignoreCase = true) } ?: "On"
+                    val offValue = setting.values.firstOrNull { it.equals("Off", ignoreCase = true) } ?: "Off"
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.testTag("live-view-exposure-simulation"),
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(stringResource(R.string.live_view_exposure_simulation), color = AppText)
+                            Text(
+                                stringResource(R.string.live_view_exposure_simulation_hint),
+                                color = AppSubtleText,
+                            )
+                        }
+                        Switch(
+                            checked = enabled,
+                            onCheckedChange = { checked ->
+                                actions.setCameraSetting(setting.key, if (checked) onValue else offValue)
+                            },
+                            enabled = !state.previewMode && !state.isBusy(CameraOperation.SETTING),
+                        )
+                    }
                 }
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(stringResource(R.string.composition_grid), color = AppText, modifier = Modifier.weight(1f))
@@ -1151,6 +1177,7 @@ private fun liveViewSourceLabel(source: LiveViewSource): String = stringResource
 @Composable
 private fun MoreSettingsSheet(state: CameraUiState, actions: CameraActions) {
     val settings = settingsForMode(state.capabilities?.advancedSettings.orEmpty(), state.captureMode)
+        .filterNot { it.key == "exposuresimulation" }
     var showSleepConfirmation by remember { mutableStateOf(false) }
     var showSensorCleaningConfirmation by remember { mutableStateOf(false) }
     var showDirectoryCreation by remember { mutableStateOf(false) }
@@ -2066,6 +2093,7 @@ private fun cameraSettingLabel(setting: CameraSettingControl): String = when (se
     "directoryselection" -> stringResource(R.string.setting_capture_directory)
     "highisonr" -> stringResource(R.string.setting_high_iso_noise_reduction)
     "alomode" -> stringResource(R.string.setting_auto_lighting_optimizer)
+    "exposuresimulation" -> stringResource(R.string.setting_exposure_simulation)
     "aeb" -> stringResource(R.string.setting_aeb)
     "ae" -> stringResource(R.string.setting_ae_mode)
     "ownername" -> stringResource(R.string.setting_owner_name)

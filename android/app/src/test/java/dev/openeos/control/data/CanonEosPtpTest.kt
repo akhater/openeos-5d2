@@ -479,6 +479,7 @@ class CanonEosPtpTest {
                 "drivemode",
                 "meteringmode",
                 "highisonr",
+                "exposuresimulation",
                 "aeb",
                 "picturestyle",
                 "stillimagequality",
@@ -527,6 +528,7 @@ class CanonEosPtpTest {
         assertEquals(0xD10C, CanonEosPropertyCode.WHITE_BALANCE_ADJUST_B)
         assertEquals(0xD10F, CanonEosPropertyCode.COLOR_SPACE)
         assertEquals(0xD178, CanonEosPropertyCode.HIGH_ISO_NOISE_REDUCTION)
+        assertEquals(0xD1B7, CanonEosPropertyCode.EXPOSURE_SIMULATION_MODE)
         assertEquals(0xD1D9, CanonEosPropertyCode.AEB)
         assertEquals("-3", CanonEosPtp.propertyLabel(CanonEosPropertyCode.EXPOSURE_COMPENSATION, 0xE8))
         assertEquals("1.3", CanonEosPtp.propertyLabel(CanonEosPropertyCode.EXPOSURE_COMPENSATION, 0x0B))
@@ -534,6 +536,8 @@ class CanonEosPtpTest {
         assertEquals("-9", CanonEosPtp.propertyLabel(CanonEosPropertyCode.WHITE_BALANCE_ADJUST_A, -9))
         assertEquals("AdobeRGB", CanonEosPtp.propertyLabel(CanonEosPropertyCode.COLOR_SPACE, 2))
         assertEquals("High", CanonEosPtp.propertyLabel(CanonEosPropertyCode.HIGH_ISO_NOISE_REDUCTION, 3))
+        assertEquals("Off", CanonEosPtp.propertyLabel(CanonEosPropertyCode.EXPOSURE_SIMULATION_MODE, 0))
+        assertEquals("On", CanonEosPtp.propertyLabel(CanonEosPropertyCode.EXPOSURE_SIMULATION_MODE, 1))
         assertEquals("+/- 2", CanonEosPtp.propertyLabel(CanonEosPropertyCode.AEB, 0x10))
 
         assertArrayEquals(
@@ -543,6 +547,10 @@ class CanonEosPtpTest {
         assertArrayEquals(
             CanonEosPtp.uint32PropertyPayload(CanonEosPropertyCode.COLOR_TEMPERATURE, 5600),
             CanonEosPtp.propertyPayload(CanonEosPropertyCode.COLOR_TEMPERATURE, 5600),
+        )
+        assertArrayEquals(
+            CanonEosPtp.uint32PropertyPayload(CanonEosPropertyCode.EXPOSURE_SIMULATION_MODE, 1),
+            CanonEosPtp.propertyPayload(CanonEosPropertyCode.EXPOSURE_SIMULATION_MODE, 1),
         )
         assertArrayEquals(
             byteArrayOf(

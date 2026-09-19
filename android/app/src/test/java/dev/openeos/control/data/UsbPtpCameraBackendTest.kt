@@ -1063,6 +1063,7 @@ class UsbPtpCameraBackendTest {
         backend.setSetting("autopoweroff", "Disable")
         backend.setSetting("highisonr", "High")
         backend.setSetting("alomode", "High")
+        backend.setSetting("exposuresimulation", "On")
         backend.setSetting("aeb", "+/- 2")
         backend.setSetting("moviemode", "on")
         backend.setSetting("moviemode", "off")
@@ -1114,6 +1115,8 @@ class UsbPtpCameraBackendTest {
         assertEquals("5200", settings.getValue("colortemperature").value)
         assertEquals("0", settings.getValue("whitebalanceadjusta").value)
         assertEquals("-2", settings.getValue("whitebalanceadjustb").value)
+        assertEquals("Off", settings.getValue("exposuresimulation").value)
+        assertEquals(listOf("Off", "On"), settings.getValue("exposuresimulation").values)
         assertEquals(listOf("sRGB", "AdobeRGB"), settings.getValue("colorspace").values)
         assertEquals("1.6x", settings.getValue("aspectratio").value)
         assertEquals(listOf("3:2", "1:1", "4:3", "16:9", "1.6x"), settings.getValue("aspectratio").values)
@@ -3645,6 +3648,8 @@ class UsbPtpCameraBackendTest {
                 CanonEosPropertyCode.AUTO_LIGHTING_OPTIMIZER,
                 0x00010000, 0x00010101, 0x00010202, 0x00010303,
             )
+            payload += eosPropertyValue(CanonEosPropertyCode.EXPOSURE_SIMULATION_MODE, 0)
+            payload += eosAvailableValues(CanonEosPropertyCode.EXPOSURE_SIMULATION_MODE, 0, 1)
             payload += eosPropertyValue(CanonEosPropertyCode.AEB, 0)
             payload += eosAvailableValues(
                 CanonEosPropertyCode.AEB,

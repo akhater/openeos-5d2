@@ -1429,7 +1429,9 @@ class UsbPtpCameraBackend(
 
     private fun hasCanonPropertyDiscoveryEvidence(): Boolean =
         hasCanonCorePropertyOptions() ||
-            canonPropertyState(CanonEosPropertyCode.FIXED_MOVIE).currentValue in 0L..1L
+            canonPropertyState(CanonEosPropertyCode.FIXED_MOVIE).currentValue in 0L..1L ||
+            canonPropertyState(CanonEosPropertyCode.EXPOSURE_SIMULATION_MODE).currentValue
+                ?.let { it in 0L..1L } == true
 
     private suspend fun awaitCanonCapturedObjectLocked(hostTransferPrepared: Boolean) {
         var deadline = System.currentTimeMillis() + CANON_CAPTURE_EVENT_TIMEOUT_MILLIS
@@ -1862,8 +1864,9 @@ class UsbPtpCameraBackend(
     private suspend fun setAdvertisedCanonProperty(propertyCode: Int, label: String): Boolean {
         if (!CanonEosPtp.supportsPropertyControl(requireDeviceInfo())) return false
         val state = canonPropertyState(propertyCode)
-        if (state.availableValues.isEmpty()) return false
-        val value = CanonEosPtp.propertyValue(propertyCode, state.availableValues, label)
+        val availableValues = canonPropertyControlValues(propertyCode, state)
+        if (availableValues.isEmpty()) return false
+        val value = CanonEosPtp.propertyValue(propertyCode, availableValues, label)
             ?: throw PtpProtocolException(
                 "Value '$label' is not advertised for Canon EOS USB property " +
                     "0x${propertyCode.toString(16).uppercase().padStart(4, '0')}."
@@ -1924,7 +1927,10 @@ class UsbPtpCameraBackend(
         if (canSetCanonProperties) {
             CanonEosPtp.settingSpecs.forEach { spec ->
                 val state = canonPropertyState(spec.propertyCode)
-                val options = CanonEosPtp.propertyOptions(spec.propertyCode, state.availableValues)
+                val options = CanonEosPtp.propertyOptions(
+                    spec.propertyCode,
+                    canonPropertyControlValues(spec.propertyCode, state),
+                )
                 if (options.isNotEmpty()) {
                     controls[spec.key] = CameraSettingControl(
                         key = spec.key,
@@ -1964,6 +1970,20 @@ class UsbPtpCameraBackend(
             }
         }
         return controls.values.toList()
+    }
+
+    private fun canonPropertyControlValues(
+        propertyCode: Int,
+        state: CanonEosPropertyState,
+    ): List<Long> = state.availableValues.ifEmpty {
+        if (
+            propertyCode == CanonEosPropertyCode.EXPOSURE_SIMULATION_MODE &&
+            state.currentValue?.let { it in 0L..1L } == true
+        ) {
+            listOf(0L, 1L)
+        } else {
+            emptyList()
+        }
     }
 
     private fun movieModeControl(info: PtpDeviceInfo): CameraSettingControl? {

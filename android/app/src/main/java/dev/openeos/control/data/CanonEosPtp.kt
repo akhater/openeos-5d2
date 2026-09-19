@@ -56,6 +56,7 @@ object CanonEosPropertyCode {
     const val MULTI_ASPECT = 0xD194
     const val EVF_OUTPUT_DEVICE = 0xD1B0
     const val EVF_MODE = 0xD1B1
+    const val EXPOSURE_SIMULATION_MODE = 0xD1B7
     const val EVF_RECORD_STATUS = 0xD1B8
     const val LIVE_VIEW_AF_SYSTEM = 0xD1BA
     const val AUTO_LIGHTING_OPTIMIZER = 0xD1C1
@@ -186,6 +187,11 @@ object CanonEosPtp {
             CanonEosPropertyCode.HIGH_ISO_NOISE_REDUCTION,
             "highisonr",
             "High ISO noise reduction",
+        ),
+        CanonEosSettingSpec(
+            CanonEosPropertyCode.EXPOSURE_SIMULATION_MODE,
+            "exposuresimulation",
+            "Live View exposure simulation",
         ),
         CanonEosSettingSpec(CanonEosPropertyCode.AEB, "aeb", "Auto exposure bracketing"),
         CanonEosSettingSpec(CanonEosPropertyCode.PICTURE_STYLE, "picturestyle", "Picture style"),
@@ -1095,6 +1101,7 @@ object CanonEosPtp {
         CanonEosPropertyCode.HIGH_ISO_NOISE_REDUCTION to CanonEosPropertySpec(2, highIsoNoiseReductionLabels),
         CanonEosPropertyCode.MOVIE_SERVO_AF to CanonEosPropertySpec(4, offOnLabels),
         CanonEosPropertyCode.UTC_TIME to CanonEosPropertySpec(4, emptyMap()),
+        CanonEosPropertyCode.EXPOSURE_SIMULATION_MODE to CanonEosPropertySpec(4, offOnLabels),
         CanonEosPropertyCode.EVF_RECORD_STATUS to CanonEosPropertySpec(2, movieRecordTargetLabels),
         CanonEosPropertyCode.LIVE_VIEW_AF_SYSTEM to CanonEosPropertySpec(4, afMethodLabels),
         // libgphoto2's Generic32 table and EOS event parser establish the wire width.

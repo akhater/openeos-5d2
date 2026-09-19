@@ -11,12 +11,12 @@ USB-OTG, so we don't lose track of them between sessions.
   reflects the final exposure. This is preferable to artificially brightening
   or darkening frames in the app because it lets the camera account for ISO,
   shutter speed, aperture, exposure compensation, and its own processing.
-  The current USB path only enables the basic Canon Live View mode and
-  output device. It does not expose a separate simulation control or a true
-  camera exposure-meter value. Before adding a UI switch, validate the
-  5D2-specific Canon PTP property/event: the current table uses `0xD1B1`,
-  while the bundled 5D2-era reference identifies the 5D2 Live View control as
-  `0xD1B3`.
+  The USB path now recognizes the separate Canon `ExposureSimMode` property
+  (`0xD1B7`) and exposes it as an On/Off control in the Live View settings
+  sheet when the camera reports it. The implementation still needs validation
+  on the real 5D2, including comparison with the JPEG returned by
+  `GetViewFinderData`, because the app cannot synthesize the camera's exact
+  processing or exposure-meter reading.
   The camera's on-body Exposure Simulation setting should also be compared
   with the JPEG returned by `GetViewFinderData` to confirm whether the USB
   preview already follows it. If the setting is not remotely writable, keep

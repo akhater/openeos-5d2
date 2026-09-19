@@ -67,6 +67,8 @@
     <string name="more_settings">More settings</string>
     <string name="live_view_settings">Live View settings</string>
     <string name="live_view">Live View</string>
+    <string name="live_view_exposure_simulation">Exposure simulation</string>
+    <string name="live_view_exposure_simulation_hint">Make Live View brightness follow the current photo exposure settings.</string>
     <string name="live_view_magnify_to">Set Live View magnification to %1$d×</string>
     <string name="live_view_unavailable">Live View unavailable</string>
     <string name="tap_to_focus">Tap to focus</string>
@@ -335,6 +337,7 @@
     <string name="setting_capture_target">Capture target</string>
     <string name="setting_high_iso_noise_reduction">High ISO noise reduction</string>
     <string name="setting_auto_lighting_optimizer">Auto Lighting Optimizer</string>
+    <string name="setting_exposure_simulation">Live View exposure simulation</string>
     <string name="setting_aeb">Auto exposure bracketing (AEB)</string>
     <string name="setting_ae_mode">AE mode</string>
     <string name="setting_owner_name">Owner name</string>
