@@ -499,13 +499,21 @@ class UsbPtpCameraBackend(
             ensureCanonRemoteMode()
             val ptp = requireSession()
             canonEventMutex.withLock {
-                drainCanonEventsLocked()
+                // A Canon EOS can acknowledge a property write before the
+                // shutter path is ready again.  Drain the event queue and
+                // give the body a short settling window before sending the
+                // one-shot command, otherwise 5D Mark II bodies can answer
+                // the capture request with DEVICE_BUSY while Live View is up.
+                drainCanonEventsRetryingLocked(
+                    System.currentTimeMillis() + CANON_CAPTURE_READY_TIMEOUT_MILLIS,
+                )
+                delay(CANON_CAPTURE_SETTLE_DELAY_MILLIS)
                 val hostTransferPrepared = prepareCanonCaptureDestination()
                 // The 5D Mark II advertises Canon's dedicated still-capture
                 // operation (0x910F). Prefer it over the two-stage remote
                 // release sequence; the latter can leave the shutter held on
                 // older EOS bodies.
-                ptp.executeOperation(CanonEosOperationCode.TAKE_PICTURE)
+                executeCanonTakePictureWithRetry(ptp)
                 awaitCanonCapturedObjectLocked(hostTransferPrepared)
             }
             observedFeatures.add(CameraFeature.STILL_CAPTURE)
@@ -1276,6 +1284,44 @@ class UsbPtpCameraBackend(
     private suspend fun drainCanonEventsLocked(): ByteArray =
         requireSession().executeDataInOperation(CanonEosOperationCode.GET_EVENT).also(::applyCanonPropertyUpdates)
 
+    private suspend fun drainCanonEventsRetryingLocked(deadlineMillis: Long): ByteArray {
+        var retryDelay = 25L
+        while (true) {
+            try {
+                return drainCanonEventsLocked()
+            } catch (exception: PtpResponseException) {
+                if (
+                    exception.responseCode != PtpResponseCode.DEVICE_BUSY ||
+                    System.currentTimeMillis() >= deadlineMillis
+                ) {
+                    throw exception
+                }
+                delay(retryDelay)
+                retryDelay = (retryDelay + 25L).coerceAtMost(150L)
+            }
+        }
+    }
+
+    private suspend fun executeCanonTakePictureWithRetry(ptp: PtpSession) {
+        val deadline = System.currentTimeMillis() + CANON_CAPTURE_READY_TIMEOUT_MILLIS
+        var retryDelay = 50L
+        while (true) {
+            try {
+                ptp.executeOperation(CanonEosOperationCode.TAKE_PICTURE)
+                return
+            } catch (exception: PtpResponseException) {
+                if (
+                    exception.responseCode != PtpResponseCode.DEVICE_BUSY ||
+                    System.currentTimeMillis() >= deadline
+                ) {
+                    throw exception
+                }
+                delay(retryDelay)
+                retryDelay = (retryDelay + 50L).coerceAtMost(250L)
+            }
+        }
+    }
+
     private suspend fun refreshCanonPropertyState(info: PtpDeviceInfo) {
         if (!CanonEosPtp.supportsRemotePreparation(info)) return
         if (!canonRemotePrepared) {
@@ -1388,7 +1434,7 @@ class UsbPtpCameraBackend(
         var hostTransferCount = 0
         var hostTransferQuietAt = Long.MAX_VALUE
         do {
-            val payload = drainCanonEventsLocked()
+            val payload = drainCanonEventsRetryingLocked(deadline)
             val transfers = CanonEosPtp.objectTransferRequests(payload)
             if (transfers.isNotEmpty()) {
                 if (!hostTransferPrepared) {
@@ -2458,6 +2504,8 @@ private const val CANON_TOUCH_AF_MODE = 3L
 private const val CANON_PROPERTY_DISCOVERY_ATTEMPTS = 10
 private const val CANON_PROPERTY_DISCOVERY_RETRY_MILLIS = 50L
 private const val MAX_CANON_UNKNOWN_PROPERTIES = 64
+private const val CANON_CAPTURE_READY_TIMEOUT_MILLIS = 3_000L
+private const val CANON_CAPTURE_SETTLE_DELAY_MILLIS = 250L
 private const val CANON_CAPTURE_EVENT_TIMEOUT_MILLIS = 90_000L
 private const val CANON_HOST_TRANSFER_QUIET_MILLIS = 1_000L
 private const val CANON_HOST_TRANSFER_CHUNK_BYTES = 1 * 1024 * 1024

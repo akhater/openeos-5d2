@@ -940,6 +940,28 @@ class UsbPtpCameraBackendTest {
     }
 
     @Test
+    fun canonCaptureRetriesBusyBodyAfterLiveViewSettingChange() = runTest {
+        val transport = CanonEosScriptedTransport(
+            advertiseCanonTakePicture = true,
+            busyCaptureEventResponsesAfterCapture = 2,
+        )
+        val backend = UsbPtpCameraBackend(
+            connection = CameraConnection.AndroidUsbPtp("usb-5d2-live-view"),
+            transportFactory = PtpTransportFactory { transport },
+        )
+        backend.initialize()
+
+        backend.startLiveView(LiveViewRequest(fps = 30, size = LiveViewSize.MEDIUM))
+        backend.setExposure(iso = "800", shutter = null, aperture = null)
+        backend.captureStill()
+
+        assertTrue(transport.hasOperation(CanonEosOperationCode.TAKE_PICTURE))
+        assertTrue(CameraFeature.STILL_CAPTURE in backend.observedFeatures())
+        backend.stopLiveView()
+        backend.close()
+    }
+
+    @Test
     fun canonAppCaptureOwnsObjectEventsWhileBackgroundPollingIsActive() = runTest {
         val transport = CanonEosScriptedTransport(delayAfterFullReleaseMillis = 100L)
         val backend = UsbPtpCameraBackend(
@@ -3078,6 +3100,7 @@ class UsbPtpCameraBackendTest {
         private val advertiseHostTransferOperations: Boolean = hostCaptureObjects.isNotEmpty(),
         private val rejectPartialAtOffset: Long? = null,
         private val delayAfterFullReleaseMillis: Long = 0L,
+        private val busyCaptureEventResponsesAfterCapture: Int = 0,
         private val currentStorageId: Long? = null,
         private val storageDevices: MutableList<StorageFixture> = mutableListOf(defaultStorageFixture()),
         private val advertisedClockProperty: Int? = CanonEosPropertyCode.UTC_TIME,
@@ -3090,6 +3113,7 @@ class UsbPtpCameraBackendTest {
         var closed = false
         private var pendingPropertyWrite = false
         private var captureEventPending = false
+        private var captureEventBusyResponsesRemaining = busyCaptureEventResponsesAfterCapture
         private var fullPressActive = false
         private var initialPropertyEventsPending = true
         private var moviePropertyEventPending: Int? = null
@@ -3227,6 +3251,11 @@ class UsbPtpCameraBackendTest {
                 }
 
                 CanonEosOperationCode.GET_EVENT -> {
+                    if (captureEventBusyResponsesRemaining > 0 && captureEventPending) {
+                        captureEventBusyResponsesRemaining -= 1
+                        incoming += response(PtpResponseCode.DEVICE_BUSY, transaction)
+                        return
+                    }
                     val moviePropertyValue = moviePropertyEventPending
                     val payload = when {
                         initialPropertyEventsPending -> canonPropertyEvents(
