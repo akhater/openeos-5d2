@@ -3151,6 +3151,7 @@ class UsbPtpCameraBackendTest {
                             advertiseMovieModeSwitch,
                             advertisePropertyWrites,
                             advertiseTextMetadata || advertiseLensName,
+                            advertiseCanonTakePicture,
                         ),
                     )
                     incoming += ok(transaction)
@@ -3802,6 +3803,7 @@ class UsbPtpCameraBackendTest {
             advertiseMovieModeSwitch: Boolean = true,
             advertisePropertyWrites: Boolean = true,
             advertiseTextMetadata: Boolean = false,
+            advertiseCanonTakePicture: Boolean = false,
         ): ByteArray = Writer().apply {
             u16(100)
             u32(CanonEosPtp.VENDOR_EXTENSION_ID)
