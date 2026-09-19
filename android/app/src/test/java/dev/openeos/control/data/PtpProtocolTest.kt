@@ -1,5 +1,7 @@
 package dev.openeos.control.data
 
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -13,6 +15,57 @@ import java.io.OutputStream
 import java.nio.charset.StandardCharsets
 
 class PtpProtocolTest {
+    @Test
+    fun cancellingAfterCommandSendDrainsResponseBeforeNextOperation() = runTest {
+        val commandSent = CompletableDeferred<Unit>()
+        val responseReceiveStarted = CompletableDeferred<Unit>()
+        val releaseResponse = CompletableDeferred<Unit>()
+        val transport = FakePtpTransport(
+            data(PtpOperationCode.GET_DEVICE_INFO, 0, deviceInfoPayload()),
+            ok(0),
+            ok(0),
+            ok(1),
+            ok(2),
+        )
+        transport.onSend = { container ->
+            if (container.code == CanonEosOperationCode.TAKE_PICTURE) commandSent.complete(Unit)
+        }
+        transport.beforeReceive = { container ->
+            if (container.transactionId == 1L && !releaseResponse.isCompleted) {
+                responseReceiveStarted.complete(Unit)
+                releaseResponse.await()
+            }
+        }
+        val session = PtpSession(transport)
+        session.initialize()
+
+        val cancelledCapture = launch {
+            session.executeOperation(CanonEosOperationCode.TAKE_PICTURE)
+        }
+        commandSent.await()
+        responseReceiveStarted.await()
+        cancelledCapture.cancel()
+
+        // Cancellation must not release the PTP mutex while the response is
+        // still unread from the transport.
+        assertFalse(cancelledCapture.isCompleted)
+        releaseResponse.complete(Unit)
+        cancelledCapture.join()
+
+        // This would consume the previous response if the cancelled command
+        // had been allowed to unwind in the middle of the USB read.
+        session.executeOperation(PtpOperationCode.DELETE_OBJECT, listOf(1L))
+        assertEquals(
+            listOf(
+                PtpOperationCode.GET_DEVICE_INFO,
+                PtpOperationCode.OPEN_SESSION,
+                CanonEosOperationCode.TAKE_PICTURE,
+                PtpOperationCode.DELETE_OBJECT,
+            ),
+            transport.sent.map(PtpContainer::code),
+        )
+    }
+
     @Test
     fun bufferedInputPreservesPayloadReceivedWithTheHeader() = runTest {
         val completeContainer = PtpCodec.encode(
@@ -493,13 +546,17 @@ class PtpProtocolTest {
         private val incoming = ArrayDeque(incoming.toList())
         val sent = mutableListOf<PtpContainer>()
         var closed = false
+        var onSend: (suspend (PtpContainer) -> Unit)? = null
+        var beforeReceive: (suspend (PtpContainer) -> Unit)? = null
 
         override suspend fun send(container: PtpContainer) {
             sent += container
+            onSend?.invoke(container)
         }
 
         override suspend fun receive(maxPayloadBytes: Int): PtpContainer {
             val next = incoming.removeFirstOrNull() ?: error("No fake PTP response is queued.")
+            beforeReceive?.invoke(next)
             if (next.payload.size > maxPayloadBytes) error("Fake payload exceeds metadata limit.")
             return next
         }

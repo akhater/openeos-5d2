@@ -1,7 +1,9 @@
 package dev.openeos.control.data
 
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.io.OutputStream
@@ -461,8 +463,8 @@ class PtpSession(
     private var sessionOpen = false
     private var cachedDeviceInfo: PtpDeviceInfo? = null
 
-    suspend fun initialize(): PtpDeviceInfo = mutex.withLock {
-        cachedDeviceInfo?.let { return@withLock it }
+    suspend fun initialize(): PtpDeviceInfo = withPtpLock {
+        cachedDeviceInfo?.let { return@withPtpLock it }
         val infoPayload = executeLocked(
             operationCode = PtpOperationCode.GET_DEVICE_INFO,
             transactionId = 0L,
@@ -595,7 +597,7 @@ class PtpSession(
         dataType: PtpDataType,
         value: PtpPropertyValue,
     ) {
-        mutex.withLock {
+        withPtpLock {
             requireOpen()
             val transactionId = takeTransactionId()
             val payload = PtpPropertyCodec.encodeValue(dataType, value)
@@ -643,7 +645,7 @@ class PtpSession(
         objectInfo: PtpObjectInfo,
         source: InputStream,
         onProgress: (bytesTransferred: Long, totalBytes: Long) -> Unit = { _, _ -> },
-    ): PtpSendObjectInfoResult = mutex.withLock {
+    ): PtpSendObjectInfoResult = withPtpLock {
         requireOpen()
         if (storageId !in 1L until UINT32_MAX) throw PtpProtocolException("SendObjectInfo requires a storage ID.")
         if (parentObject !in 0L..UINT32_MAX) throw PtpProtocolException("SendObjectInfo parent exceeds UINT32.")
@@ -698,7 +700,7 @@ class PtpSession(
         operationCode: Int,
         parameters: List<Long> = emptyList(),
     ) {
-        mutex.withLock {
+        withPtpLock {
             requireOpen()
             executeLocked(
                 operationCode = operationCode,
@@ -719,7 +721,7 @@ class PtpSession(
         payload: ByteArray,
         parameters: List<Long> = emptyList(),
     ) {
-        mutex.withLock {
+        withPtpLock {
             requireOpen()
             val transactionId = takeTransactionId()
             transport.send(PtpCodec.command(operationCode, transactionId, parameters))
@@ -739,7 +741,7 @@ class PtpSession(
         handle: Long,
         destination: OutputStream,
         onProgress: (bytesTransferred: Long, totalBytes: Long) -> Unit = { _, _ -> },
-    ): Long = mutex.withLock {
+    ): Long = withPtpLock {
         requireOpen()
         val transactionId = takeTransactionId()
         transport.send(PtpCodec.command(PtpOperationCode.GET_OBJECT, transactionId, listOf(handle)))
@@ -778,7 +780,7 @@ class PtpSession(
                 PtpContainerType.RESPONSE -> {
                     checkResponse(header.code, PtpOperationCode.GET_OBJECT)
                     if (!receivedData) throw PtpProtocolException("GetObject completed without object data.")
-                    return@withLock bytesTransferred
+                    return@withPtpLock bytesTransferred
                 }
 
                 PtpContainerType.COMMAND -> throw PtpProtocolException("Camera returned a command container to GetObject.")
@@ -811,7 +813,7 @@ class PtpSession(
     }
 
     suspend fun shutdown() {
-        mutex.withLock {
+        withPtpLock {
             try {
                 if (sessionOpen) {
                     runCatching {
@@ -836,12 +838,23 @@ class PtpSession(
         transport.close()
     }
 
+    /**
+     * A USB PTP transaction cannot be cancelled after its command has been sent.
+     * Android's bulk transfers may already contain the camera's response when the
+     * caller is cancelled. Letting that response remain unread poisons the next
+     * command, so the transport exchange must finish before cancellation unwinds.
+     */
+    private suspend fun <T> withPtpLock(block: suspend () -> T): T =
+        mutex.withLock {
+            withContext(NonCancellable) { block() }
+        }
+
     private suspend fun <T> transaction(
         operationCode: Int,
         parameters: List<Long> = emptyList(),
         maxPayloadBytes: Int = DEFAULT_PTP_METADATA_BYTES,
         parser: (ByteArray) -> T,
-    ): T = mutex.withLock {
+    ): T = withPtpLock {
         requireOpen()
         val payload = executeLocked(
             operationCode = operationCode,

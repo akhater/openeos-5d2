@@ -211,6 +211,7 @@ internal val LIVE_VIEW_INTERLOCK_OPERATIONS = setOf(
     CameraOperation.CLOCK,
     CameraOperation.MEDIA,
     CameraOperation.MAINTENANCE,
+    CameraOperation.POWER,
 )
 
 data class FocusPoint(

@@ -122,6 +122,8 @@ class CameraRepository(
                     }
                 } catch (exception: Exception) {
                     // A session can still provide settings and status without live view.
+                    runCatching { backend.stopLiveView() }
+                    liveViewRunning = false
                     liveViewStartError = "${exception.javaClass.simpleName}: ${exception.message ?: "Live View start failed"}"
                 }
             }
@@ -294,13 +296,23 @@ class CameraRepository(
         connectionMutex.withLock {
             check(active) { "Camera is not connected." }
             if (liveViewRunning && (!enabled || restart)) {
-                // Retain ownership on failure so a later stop/disconnect can retry cleanup.
-                backend.stopLiveView()
-                liveViewRunning = false
+                try {
+                    backend.stopLiveView()
+                } finally {
+                    // The backend clears its own transport state in the same
+                    // situation. Keep the repository's state authoritative too.
+                    liveViewRunning = false
+                }
             }
             if (enabled && !liveViewRunning) {
-                backend.startLiveView(liveViewRequest)
-                liveViewRunning = true
+                try {
+                    backend.startLiveView(liveViewRequest)
+                    liveViewRunning = true
+                } catch (exception: Exception) {
+                    liveViewRunning = false
+                    runCatching { backend.stopLiveView() }
+                    throw exception
+                }
                 liveViewRequest = liveViewRequest.clampTo(backend.capabilities().liveView)
             }
             liveViewRequest

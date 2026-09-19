@@ -1162,6 +1162,8 @@ class UsbPtpCameraBackend(
                     payload = CanonEosPtp.uint32PropertyPayload(CanonEosPropertyCode.EVF_OUTPUT_DEVICE, 0L),
                 )
             }
+            canonLiveViewActive = false
+            canonLiveViewGeometry = null
             throw exception
         }
     }
