@@ -58,7 +58,7 @@ class CameraRepository(
         vendorId: Int,
         productId: Int,
         request: LiveViewRequest = liveViewRequest,
-        startLiveView: Boolean = true,
+        startLiveView: Boolean = false,
     ): CameraSession = connect(
         connection = CameraConnection.AndroidUsbPtp(
             deviceName = deviceName,

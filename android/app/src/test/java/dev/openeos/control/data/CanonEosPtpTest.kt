@@ -864,7 +864,12 @@ class CanonEosPtpTest {
                 )
             )
         )
-        assertFalse(CanonEosPtp.supportsLiveView(complete.copy(vendorExtensionId = 0L)))
+        assertTrue(CanonEosPtp.supportsLiveView(complete.copy(vendorExtensionId = 0L)))
+        assertFalse(
+            CanonEosPtp.supportsLiveView(
+                complete.copy(vendorExtensionId = 0L, manufacturer = "Nikon Corporation")
+            )
+        )
     }
 
     @Test
@@ -911,7 +916,10 @@ class CanonEosPtpTest {
         repeat(2) { index -> destination[offset + index] = (value ushr (index * 8)).toByte() }
     }
 
-    private fun deviceInfo(operations: Set<Int>) = PtpDeviceInfo(
+    private fun deviceInfo(
+        operations: Set<Int>,
+        manufacturer: String = "Canon.Inc",
+    ) = PtpDeviceInfo(
         standardVersion = 100,
         vendorExtensionId = CanonEosPtp.VENDOR_EXTENSION_ID,
         vendorExtensionVersion = 100,
@@ -922,7 +930,7 @@ class CanonEosPtpTest {
         deviceProperties = emptySet(),
         captureFormats = emptySet(),
         imageFormats = emptySet(),
-        manufacturer = "Canon.Inc",
+        manufacturer = manufacturer,
         model = "Canon EOS R6 Mark III",
         deviceVersion = "3-1.0.0",
         serialNumber = "test",

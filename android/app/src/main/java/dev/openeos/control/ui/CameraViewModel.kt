@@ -546,12 +546,17 @@ class CameraViewModel(
         cancelMediaThumbnailLoads()
         resetFrameMetrics()
         lastPhotoShootingMode = null
-        _uiState.update { it.withClearedSession(baseUrl = it.baseUrl, error = null) }
+        // The EOS 5D Mark II is sensitive to sustained USB traffic. Keep Live View
+        // off for USB sessions until the user explicitly enables it from the UI.
+        _uiState.update {
+            it.withClearedSession(baseUrl = it.baseUrl, error = null)
+                .copy(liveViewAutoRefresh = false)
+        }
         val session = repository.connectUsb(
             deviceName = deviceName,
             vendorId = vendorId,
             productId = productId,
-            startLiveView = appInForeground && _uiState.value.liveViewAutoRefresh,
+            startLiveView = false,
             request = LiveViewRequest(
                 fps = _uiState.value.liveViewFrameRateFps,
                 size = _uiState.value.liveViewSize,
@@ -2318,8 +2323,13 @@ class CameraViewModel(
             )
         }
         return viewModelScope.launch {
+            val pauseEventPolling = operation in EVENT_POLLING_INTERLOCK_OPERATIONS &&
+                _uiState.value.connected && !_uiState.value.previewMode
+            if (pauseEventPolling) stopEventPollingLoopAndJoin()
+            var operationSucceeded = false
             try {
                 block()
+                operationSucceeded = true
                 if (operation in CAPABILITY_EVIDENCE_OPERATIONS) {
                     refreshCapabilityEvidence()
                 }
@@ -2346,6 +2356,10 @@ class CameraViewModel(
                     }
                 }
                 afterFinally()
+                if (pauseEventPolling && operationSucceeded && _uiState.value.connected && !_uiState.value.previewMode) {
+                    // Keep Canon's event-check traffic out of the next camera command.
+                    startEventPollingIfSupported()
+                }
                 if (operation in LIVE_VIEW_INTERLOCK_OPERATIONS) queueLiveViewReconciliation()
             }
         }
@@ -3075,6 +3089,12 @@ class CameraViewModel(
         const val MAX_MEDIA_UPLOAD_BYTES = MAX_PTP_OBJECT_BYTES
         const val MAX_MEDIA_THUMBNAIL_CACHE_ITEMS = 96
         val EVENT_RETRY_DELAYS_MILLIS = longArrayOf(1_000L, 2_000L, 5_000L)
+        val EVENT_POLLING_INTERLOCK_OPERATIONS = setOf(
+            CameraOperation.SETTING,
+            CameraOperation.CLOCK,
+            CameraOperation.CAPTURE,
+            CameraOperation.RECORDING,
+        )
         val CAPABILITY_EVIDENCE_OPERATIONS = setOf(
             CameraOperation.CONNECT,
             CameraOperation.SETTING,
