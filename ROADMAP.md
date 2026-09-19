@@ -5,6 +5,29 @@ USB-OTG, so we don't lose track of them between sessions.
 
 ## Open
 
+- **Priority: expose the 5D Mark II's native Live View Exposure Simulation.**
+  Canon documents that the 5D2 can switch Live View between a standard
+  brightness display and Exposure Simulation, where the preview closely
+  reflects the final exposure. This is preferable to artificially brightening
+  or darkening frames in the app because it lets the camera account for ISO,
+  shutter speed, aperture, exposure compensation, and its own processing.
+  The current USB path only enables the basic Canon EVF/Live View mode and
+  output device. It does not expose a separate simulation control or a true
+  camera exposure-meter value. Before adding a UI switch, validate the
+  5D2-specific Canon PTP property/event: the current table uses `0xD1B1`,
+  while the bundled 5D2-era reference identifies Canon EVF mode as `0xD1B3`.
+  The camera's on-body Exposure Simulation setting should also be compared
+  with the JPEG returned by `GetViewFinderData` to confirm whether the USB
+  preview already follows it. If the setting is not remotely writable, keep
+  the fallback as a documented camera-side setting rather than inventing an
+  inaccurate synthetic preview.
+
+- **Priority: add composition overlays beyond aspect-ratio guides.** Add
+  overlay-only guides for Rule of Thirds, Golden Ratio (initially a grid),
+  and Diagonals. This should be a low-risk UI-only change: it uses the same
+  Live View overlay layer as the existing frame guides and does not send any
+  camera commands or affect the USB transaction path.
+
 - **`PtpProtocolException: Android USB bulk write failed on endpoint
   0x2 (result -1)` still happens with deliberate single taps, not just
   rapid flicks.** The tap-to-apply fix (below) removed the
@@ -51,13 +74,12 @@ USB-OTG, so we don't lose track of them between sessions.
   on USB-OTG -- don't pull sustained live-view current unless the user
   actually asked for it.
 
-- **Live view zoom limited to 1x on the 5D2.** The camera's on-body
-  Live View supports 5x/10x zoom, but the app's magnification control
-  only ever shows 1x. Likely the 5D2's zoom property doesn't advertise
-  5/10 as available values the same way newer bodies do (this would be
-  correct capability-gating, not a bug) -- needs checking against the
-  camera's actual advertised property values before doing anything.
-  Lowest priority of the open items.
+- **Low priority: add 10x Live View zoom on the 5D2.** The current release
+  supports 1x and 5x. The model supports 5x/10x on the camera, and the app
+  already has an `X10` model value, but the USB capability list deliberately
+  advertises only the values validated so far. Add 10x only after sending the
+  Canon zoom command with value `10` has been validated on the real body and
+  its readback/failure behavior is known.
 
 ## Fixed
 
