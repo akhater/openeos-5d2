@@ -1329,10 +1329,12 @@ class CameraViewModel(
         }
         val job = viewModelScope.launch {
             try {
-                val items = repository.listMedia(maximumItemsFor(scope)) { partialItems ->
-                    if (generation == mediaLibraryGeneration) {
-                        val batch = partialItems.toMediaLibraryBatch(scope)
-                        applyMediaItems(batch.items, batch.hasMore)
+                val items = withUsbLiveViewFramesPaused {
+                    repository.listMedia(maximumItemsFor(scope)) { partialItems ->
+                        if (generation == mediaLibraryGeneration) {
+                            val batch = partialItems.toMediaLibraryBatch(scope)
+                            applyMediaItems(batch.items, batch.hasMore)
+                        }
                     }
                 }
                 if (generation != mediaLibraryGeneration) return@launch
@@ -2021,7 +2023,7 @@ class CameraViewModel(
                         it.copy(mediaLibraryLoadStatus = MediaLibraryLoadStatus.LOADING)
                     }
                     val items = try {
-                        repository.listMedia()
+                        withUsbLiveViewFramesPaused { repository.listMedia() }
                     } catch (exception: Exception) {
                         _uiState.update {
                             it.copy(mediaLibraryLoadStatus = MediaLibraryLoadStatus.FAILED)
@@ -2101,7 +2103,7 @@ class CameraViewModel(
             it.copy(mediaLibraryLoadStatus = MediaLibraryLoadStatus.LOADING)
         }
         val items = withContext(NonCancellable + Dispatchers.IO) {
-            runCatching { repository.listMedia() }.getOrNull()
+            runCatching { withUsbLiveViewFramesPaused { repository.listMedia() } }.getOrNull()
         } ?: run {
             _uiState.update {
                 it.copy(mediaLibraryLoadStatus = MediaLibraryLoadStatus.FAILED)
@@ -2323,19 +2325,19 @@ class CameraViewModel(
             )
         }
         return viewModelScope.launch {
-            val pauseLiveView = operation in LIVE_VIEW_INTERLOCK_OPERATIONS &&
+            val pauseLiveViewFrames = (operation in LIVE_VIEW_INTERLOCK_OPERATIONS || operation == CameraOperation.LIVE_VIEW) &&
                 _uiState.value.transport == CameraTransport.USB_PTP &&
                 _uiState.value.connected && !_uiState.value.previewMode &&
                 repository.isLiveViewRunning()
-            var liveViewPauseAttempted = false
+            var liveViewFramePauseAttempted = false
             val pauseEventPolling = operation in EVENT_POLLING_INTERLOCK_OPERATIONS &&
                 _uiState.value.connected && !_uiState.value.previewMode
             var operationSucceeded = false
             try {
                 if (pauseEventPolling) stopEventPollingLoopAndJoin()
-                if (pauseLiveView) {
-                    liveViewPauseAttempted = true
-                    pauseUsbLiveViewForCameraOperation()
+                if (pauseLiveViewFrames) {
+                    liveViewFramePauseAttempted = true
+                    pauseUsbLiveViewFramesForCameraOperation()
                 }
                 block()
                 operationSucceeded = true
@@ -2365,26 +2367,15 @@ class CameraViewModel(
                     }
                 }
                 afterFinally()
-                if (liveViewPauseAttempted && _uiState.value.connected && !_uiState.value.previewMode) {
-                    // Re-establish the EVF session before Canon event traffic resumes.
-                    try {
-                        reconcileLiveView(restart = true)
-                    } catch (exception: CancellationException) {
-                        throw exception
-                    } catch (exception: Exception) {
-                        _uiState.update {
-                            if (it.connected) it.copy(
-                                error = formatException(exception),
-                                errorOperation = CameraOperation.LIVE_VIEW,
-                            ) else it
-                        }
-                    }
+                if (liveViewFramePauseAttempted && _uiState.value.connected && !_uiState.value.previewMode) {
+                    // The camera's Live View session stays active; only frame requests are resumed.
+                    startLiveViewLoopIfNeeded()
                 }
                 if (pauseEventPolling && operationSucceeded && _uiState.value.connected && !_uiState.value.previewMode) {
                     // Keep Canon's event-check traffic out of the next camera command.
                     startEventPollingIfSupported()
                 }
-                if (operation in LIVE_VIEW_INTERLOCK_OPERATIONS && !liveViewPauseAttempted) {
+                if (operation in LIVE_VIEW_INTERLOCK_OPERATIONS && !liveViewFramePauseAttempted) {
                     queueLiveViewReconciliation()
                 }
             }
@@ -2393,23 +2384,37 @@ class CameraViewModel(
 
     /**
      * The EOS 5D Mark II is not reliable when a Live View frame request overlaps
-     * a setting/capture command. Stop the frame loop and the camera-side EVF
-     * session as one transition; the operation finally block starts it again.
+     * a setting/capture command. Stop and join the frame loop, but leave the
+     * camera's Live View session active so the mirror is not cycled.
      */
-    private suspend fun pauseUsbLiveViewForCameraOperation() = liveViewTransitionMutex.withLock {
+    private suspend fun pauseUsbLiveViewFramesForCameraOperation() = liveViewTransitionMutex.withLock {
         if (!repository.isLiveViewRunning()) return@withLock
         liveViewGeneration += 1
         stopLiveViewLoopAndJoin()
-        repository.setNativeLiveViewRenderingEnabled(false)
-        repository.setLiveViewEnabled(false)
-        _uiState.update {
-            it.copy(
-                liveViewBitmap = null,
-                liveViewFrameUrl = null,
-                nativeLiveViewSession = null,
-                liveViewDiagnostics = LiveViewDiagnostics(),
-                liveViewAudioStatus = NativeLiveViewAudioStatus.None,
-            )
+    }
+
+    private suspend fun <T> withUsbLiveViewFramesPaused(block: suspend () -> T): T {
+        // A capture/setting/zoom operation owns the camera until its pending flag is cleared.
+        // Capture-review jobs can be launched from inside those operations, so wait here rather
+        // than letting a media request run beside the command that created it.
+        while (_uiState.value.pendingOperations.any { it != CameraOperation.MEDIA }) {
+            delay(25L)
+        }
+        val state = _uiState.value
+        val shouldPause = state.transport == CameraTransport.USB_PTP &&
+            state.connected && !state.previewMode && repository.isLiveViewRunning()
+        if (!shouldPause) return block()
+
+        return liveViewTransitionMutex.withLock {
+            liveViewGeneration += 1
+            stopLiveViewLoopAndJoin()
+            try {
+                block()
+            } finally {
+                if (_uiState.value.connected && !_uiState.value.previewMode && repository.isLiveViewRunning()) {
+                    startLiveViewLoopIfNeeded()
+                }
+            }
         }
     }
 
@@ -2685,7 +2690,7 @@ class CameraViewModel(
                                     current
                                 }
                             }
-                            runCatching { repository.listMedia(RECENT_MEDIA_REQUEST_ITEMS) }
+                            runCatching { withUsbLiveViewFramesPaused { repository.listMedia(RECENT_MEDIA_REQUEST_ITEMS) } }
                         } else {
                             Result.success(emptyList())
                         }
@@ -2929,7 +2934,7 @@ class CameraViewModel(
                 expectedPreviousId = expectedPreviousId,
                 retryDelaysMillis = CAPTURE_REVIEW_RETRY_DELAYS_MILLIS,
             ) {
-                repository.listMedia(CAPTURE_REVIEW_REQUEST_ITEMS)
+                withUsbLiveViewFramesPaused { repository.listMedia(CAPTURE_REVIEW_REQUEST_ITEMS) }
             }
             if (generation != captureReviewGeneration) return@launch
             if (selected == null) {
@@ -3009,7 +3014,7 @@ class CameraViewModel(
         var lastFailure: Exception? = null
         repeat(MEDIA_THUMBNAIL_RETRY_DELAYS_MILLIS.size + 1) { attempt ->
             try {
-                val thumbnail = repository.mediaThumbnail(item)
+                val thumbnail = withUsbLiveViewFramesPaused { repository.mediaThumbnail(item) }
                 return withContext(Dispatchers.Default) {
                     val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                     BitmapFactory.decodeByteArray(thumbnail.bytes, 0, thumbnail.bytes.size, bounds)
@@ -3148,6 +3153,8 @@ class CameraViewModel(
             CameraOperation.CLOCK,
             CameraOperation.CAPTURE,
             CameraOperation.RECORDING,
+            CameraOperation.MEDIA,
+            CameraOperation.LIVE_VIEW,
         )
         val CAPABILITY_EVIDENCE_OPERATIONS = setOf(
             CameraOperation.CONNECT,

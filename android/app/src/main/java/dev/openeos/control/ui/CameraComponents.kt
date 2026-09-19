@@ -1088,7 +1088,7 @@ fun LiveViewFrame(state: CameraUiState, actions: CameraActions, modifier: Modifi
                 )
                 if (state.supports(CameraFeature.LIVE_VIEW) && !state.isBusy(CameraOperation.LIVE_VIEW)) {
                     Button(
-                        onClick = { actions.openPicker(SettingPicker.LIVE_VIEW) },
+                        onClick = { actions.setAutoRefresh(true) },
                         colors = ButtonDefaults.buttonColors(
                             containerColor = AppSurfaceHigh,
                             contentColor = AppText,

@@ -239,7 +239,10 @@ private fun CaptureBar(state: CameraUiState, actions: CameraActions) {
         ) {
             CaptureReviewButton(state, actions)
             CaptureButton(state, actions)
-            LiveViewFpsButton(state, { actions.openPicker(SettingPicker.LIVE_VIEW) })
+            LiveViewFpsButton(state, {
+                if (state.liveViewAutoRefresh) actions.openPicker(SettingPicker.LIVE_VIEW)
+                else actions.setAutoRefresh(true)
+            })
         }
         CaptureModeSelector(state, actions)
     }

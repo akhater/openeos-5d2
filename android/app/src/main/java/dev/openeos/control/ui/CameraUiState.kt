@@ -209,6 +209,7 @@ internal val LIVE_VIEW_INTERLOCK_OPERATIONS = setOf(
     CameraOperation.RECORDING,
     CameraOperation.SETTING,
     CameraOperation.CLOCK,
+    CameraOperation.MEDIA,
     CameraOperation.MAINTENANCE,
 )
 

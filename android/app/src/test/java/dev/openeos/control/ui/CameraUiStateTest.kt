@@ -57,6 +57,7 @@ class CameraUiStateTest {
     fun liveViewInterlockIncludesSettingsAndClockWrites() {
         assertTrue(CameraOperation.SETTING in LIVE_VIEW_INTERLOCK_OPERATIONS)
         assertTrue(CameraOperation.CLOCK in LIVE_VIEW_INTERLOCK_OPERATIONS)
+        assertTrue(CameraOperation.MEDIA in LIVE_VIEW_INTERLOCK_OPERATIONS)
     }
 
     @Test
