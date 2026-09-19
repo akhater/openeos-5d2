@@ -11,11 +11,12 @@ USB-OTG, so we don't lose track of them between sessions.
   reflects the final exposure. This is preferable to artificially brightening
   or darkening frames in the app because it lets the camera account for ISO,
   shutter speed, aperture, exposure compensation, and its own processing.
-  The current USB path only enables the basic Canon EVF/Live View mode and
+  The current USB path only enables the basic Canon Live View mode and
   output device. It does not expose a separate simulation control or a true
   camera exposure-meter value. Before adding a UI switch, validate the
   5D2-specific Canon PTP property/event: the current table uses `0xD1B1`,
-  while the bundled 5D2-era reference identifies Canon EVF mode as `0xD1B3`.
+  while the bundled 5D2-era reference identifies the 5D2 Live View control as
+  `0xD1B3`.
   The camera's on-body Exposure Simulation setting should also be compared
   with the JPEG returned by `GetViewFinderData` to confirm whether the USB
   preview already follows it. If the setting is not remotely writable, keep
@@ -27,6 +28,32 @@ USB-OTG, so we don't lose track of them between sessions.
   and Diagonals. This should be a low-risk UI-only change: it uses the same
   Live View overlay layer as the existing frame guides and does not send any
   camera commands or affect the USB transaction path.
+
+- **Add multi-shot capture for noise reduction and averaging.** Let the user
+  request a bounded number of photos with the same settings, with a deliberate
+  interval, progress, cancellation, and per-shot completion/media tracking.
+  The existing still-capture path makes the capture sequence feasible; merging
+  the resulting JPEG/RAW files into an averaged or median-denoised image is a
+  separate follow-up and must account for alignment, storage, and RAW memory
+  cost. This means repeated same-scene capture, not the camera's separate
+  creative multiple-exposure mode.
+
+- **Add exposure-bracketing workflows.** The Canon AEB property and value
+  labels already exist in the USB model, and the 5D2 supports three successive
+  bracketed shots across its documented range. What is missing is a safe app
+  workflow to configure/verify AEB, trigger the sequence, wait for every image
+  event, and present the resulting set. A software-controlled bracket remains
+  a fallback for bodies that do not expose usable AEB, but it would require
+  changing exposure between shots and therefore needs stricter serialization.
+
+- **Add focus-stacking capture workflows.** The USB backend already exposes
+  Canon manual focus drive with Near/Far steps 1-3, so an app-orchestrated
+  stack is technically possible: capture, move focus, settle, capture, and
+  repeat. The 5D2 does not provide the newer camera-native focus-bracketing
+  contract, so this needs a user-defined start position, direction, step,
+  count, and settle delay. Producing a finished stack in the app is a separate
+  alignment/merge feature; the first version can safely deliver the source
+  sequence.
 
 - **`PtpProtocolException: Android USB bulk write failed on endpoint
   0x2 (result -1)` still happens with deliberate single taps, not just
