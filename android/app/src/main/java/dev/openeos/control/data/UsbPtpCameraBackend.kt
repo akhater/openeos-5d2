@@ -679,11 +679,16 @@ class UsbPtpCameraBackend(
         if (!canonLiveViewActive) {
             throw PtpProtocolException("Canon EOS Live View magnification requires an active Live View session.")
         }
-        requireSession().executeOperation(
-            CanonEosOperationCode.ZOOM,
-            listOf(magnification.value.toLong()),
-        )
-        drainCanonEvents()
+        canonEventMutex.withLock {
+            requireSession().executeOperation(
+                CanonEosOperationCode.ZOOM,
+                listOf(magnification.value.toLong()),
+            )
+            // The command is followed by a property/event update on older EOS bodies.
+            // Consume it before the next Live View frame request so the response cannot
+            // be mistaken for the frame transaction.
+            drainCanonEventsLocked()
+        }
         observedFeatures.add(CameraFeature.LIVE_VIEW_MAGNIFICATION)
         return LiveViewMagnificationResult(ok = true, magnification = magnification)
     }

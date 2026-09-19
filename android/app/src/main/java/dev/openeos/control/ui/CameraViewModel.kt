@@ -828,7 +828,15 @@ class CameraViewModel(
         if (state.pendingOperations.any { it in LIVE_VIEW_INTERLOCK_OPERATIONS }) return@withLock
         val enabled = appInForeground && state.liveViewAutoRefresh && state.liveViewTemperatureAllowed
         val hasPresentation = state.nativeLiveViewSession != null || state.liveViewBitmap != null || state.liveViewFrameUrl != null
-        if (enabled == repository.isLiveViewRunning() && !restart && (!enabled || hasPresentation)) return@withLock
+        if (enabled == repository.isLiveViewRunning() && !restart && (!enabled || hasPresentation)) {
+            if (enabled && state.transport == CameraTransport.USB_PTP) stopEventPollingLoopAndJoin()
+            return@withLock
+        }
+        if (enabled && state.transport == CameraTransport.USB_PTP) {
+            // Canon's 5D Mark II is not reliable when GetEvent is interleaved with
+            // GetViewFinderData. Live View owns the USB command stream until it stops.
+            stopEventPollingLoopAndJoin()
+        }
         _uiState.update { it.copy(pendingOperations = it.pendingOperations + CameraOperation.LIVE_VIEW) }
         try {
             liveViewGeneration += 1
@@ -879,6 +887,9 @@ class CameraViewModel(
             if (_uiState.value.info === state.info) throw exception
         } finally {
             _uiState.update { it.copy(pendingOperations = it.pendingOperations - CameraOperation.LIVE_VIEW) }
+            if (_uiState.value.connected && !_uiState.value.previewMode && !repository.isLiveViewRunning()) {
+                startEventPollingIfSupported()
+            }
         }
     }
 
@@ -944,8 +955,6 @@ class CameraViewModel(
                     captureMode = captureMode ?: it.captureMode,
                 )
             }
-            refreshLiveViewFrameInternal(reportErrors = false)
-            startLiveViewLoopIfNeeded()
         }
     }
 
@@ -1093,8 +1102,6 @@ class CameraViewModel(
         _uiState.update { it.copy(status = status) }
         showCaptureSuccess()
         refreshCaptureReview(expectedPreviousId = previousReviewId)
-        refreshLiveViewFrameInternal(reportErrors = false)
-        startLiveViewLoopIfNeeded()
     }
 
     fun toggleBulbExposure() = runCamera(CameraOperation.CAPTURE) {
@@ -1228,8 +1235,6 @@ class CameraViewModel(
             if (_uiState.value.info !== connection) return@runCamera
             _uiState.update { it.copy(status = status, focusFeedback = FocusFeedback.ACCEPTED) }
             clearFocusFeedbackAfter(FocusFeedback.ACCEPTED)
-            refreshLiveViewFrameInternal(reportErrors = false)
-            startLiveViewLoopIfNeeded()
         }
     }
 
@@ -1255,8 +1260,6 @@ class CameraViewModel(
             if (_uiState.value.info !== connection) return@runCamera
             _uiState.update { it.copy(status = status, focusFeedback = FocusFeedback.ACCEPTED) }
             clearFocusFeedbackAfter(FocusFeedback.ACCEPTED)
-            refreshLiveViewFrameInternal(reportErrors = false)
-            startLiveViewLoopIfNeeded()
         }
     }
 
@@ -1280,8 +1283,6 @@ class CameraViewModel(
             repository.driveFocus(direction, step)
             _uiState.update { it.copy(focusFeedback = FocusFeedback.ACCEPTED) }
             clearFocusFeedbackAfter(FocusFeedback.ACCEPTED)
-            refreshLiveViewFrameInternal(reportErrors = false)
-            startLiveViewLoopIfNeeded()
         }
     }
 
@@ -1301,8 +1302,6 @@ class CameraViewModel(
             val result = repository.setLiveViewMagnification(magnification)
             if (result.ok) {
                 _uiState.update { it.copy(liveViewMagnification = result.magnification) }
-                refreshLiveViewFrameInternal(reportErrors = false)
-                startLiveViewLoopIfNeeded()
             }
         }
     }
@@ -2210,8 +2209,6 @@ class CameraViewModel(
                 )
             }
             clearFocusFeedbackAfter(FocusFeedback.ACCEPTED)
-            refreshLiveViewFrameInternal(reportErrors = false)
-            startLiveViewLoopIfNeeded()
         }
     }
 
@@ -2260,8 +2257,6 @@ class CameraViewModel(
                 )
             }
             clearFocusFeedbackAfter(FocusFeedback.SUCCESS)
-            refreshLiveViewFrameInternal(reportErrors = false)
-            startLiveViewLoopIfNeeded()
         }
     }
 
@@ -2271,8 +2266,6 @@ class CameraViewModel(
     ) = runCamera(operation) {
         val status = block()
         _uiState.update { it.copy(status = status) }
-        refreshLiveViewFrameInternal(reportErrors = false)
-        startLiveViewLoopIfNeeded()
     }
 
     private fun updatePreviewExposure(
@@ -2332,15 +2325,14 @@ class CameraViewModel(
             var liveViewFramePauseAttempted = false
             val pauseEventPolling = operation in EVENT_POLLING_INTERLOCK_OPERATIONS &&
                 _uiState.value.connected && !_uiState.value.previewMode
-            var operationSucceeded = false
             try {
                 if (pauseEventPolling) stopEventPollingLoopAndJoin()
                 if (pauseLiveViewFrames) {
                     liveViewFramePauseAttempted = true
                     pauseUsbLiveViewFramesForCameraOperation()
+                    stopCameraFocusInfoLoopAndJoin()
                 }
                 block()
-                operationSucceeded = true
                 if (operation in CAPABILITY_EVIDENCE_OPERATIONS) {
                     refreshCapabilityEvidence()
                 }
@@ -2369,9 +2361,11 @@ class CameraViewModel(
                 afterFinally()
                 if (liveViewFramePauseAttempted && _uiState.value.connected && !_uiState.value.previewMode) {
                     // The camera's Live View session stays active; only frame requests are resumed.
+                    delay(LIVE_VIEW_RESUME_DELAY_MILLIS)
                     startLiveViewLoopIfNeeded()
+                    startCameraFocusInfoLoop()
                 }
-                if (pauseEventPolling && operationSucceeded && _uiState.value.connected && !_uiState.value.previewMode) {
+                if (pauseEventPolling && _uiState.value.connected && !_uiState.value.previewMode) {
                     // Keep Canon's event-check traffic out of the next camera command.
                     startEventPollingIfSupported()
                 }
@@ -2403,16 +2397,22 @@ class CameraViewModel(
         val state = _uiState.value
         val shouldPause = state.transport == CameraTransport.USB_PTP &&
             state.connected && !state.previewMode && repository.isLiveViewRunning()
-        if (!shouldPause) return block()
+        // A MEDIA operation already paused the frame loop in launchCameraOperation.
+        // Do not restart it from a nested capture-review/media refresh while that
+        // operation still owns the camera.
+        if (!shouldPause || liveViewJob?.isActive != true) return block()
 
         return liveViewTransitionMutex.withLock {
             liveViewGeneration += 1
             stopLiveViewLoopAndJoin()
+            stopCameraFocusInfoLoopAndJoin()
             try {
                 block()
             } finally {
                 if (_uiState.value.connected && !_uiState.value.previewMode && repository.isLiveViewRunning()) {
+                    delay(LIVE_VIEW_RESUME_DELAY_MILLIS)
                     startLiveViewLoopIfNeeded()
+                    startCameraFocusInfoLoop()
                 }
             }
         }
@@ -2445,6 +2445,13 @@ class CameraViewModel(
         focusInfoJob?.cancel()
         focusInfoJob = null
         invalidateCameraFocusInfo()
+    }
+
+    private suspend fun stopCameraFocusInfoLoopAndJoin() {
+        val job = focusInfoJob
+        focusInfoJob = null
+        invalidateCameraFocusInfo()
+        job?.cancelAndJoin()
     }
 
     private fun canReadCameraFocusInfo(state: CameraUiState): Boolean =
@@ -2663,7 +2670,8 @@ class CameraViewModel(
         if (
             !state.connected ||
             state.previewMode ||
-            !state.supports(CameraFeature.EVENT_POLLING)
+            !state.supports(CameraFeature.EVENT_POLLING) ||
+            (state.transport == CameraTransport.USB_PTP && repository.isLiveViewRunning())
         ) return
 
         val generation = eventPollingGeneration
@@ -3143,6 +3151,7 @@ class CameraViewModel(
         const val KEY_CONNECTION_TARGET = "connection_target"
         const val CAPTURE_FLASH_MILLIS = 120L
         const val FOCUS_FEEDBACK_MILLIS = 1_200L
+        const val LIVE_VIEW_RESUME_DELAY_MILLIS = 150L
         const val FPS_WINDOW_SIZE = 30
         const val MEDIA_UPLOAD_BUFFER_BYTES = 64 * 1024
         const val MAX_MEDIA_UPLOAD_BYTES = MAX_PTP_OBJECT_BYTES
