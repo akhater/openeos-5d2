@@ -886,16 +886,6 @@ class CanonEosPtpTest {
                 complete.copy(vendorExtensionId = 0L, manufacturer = "Nikon Corporation")
             )
         )
-        assertEquals(
-            CanonEosLiveViewGeometry(5_616, 3_744),
-            CanonEosPtp.legacyLiveViewGeometry(
-                complete.copy(model = "Canon EOS 5D Mark II")
-            ),
-        )
-        assertEquals(
-            null,
-            CanonEosPtp.legacyLiveViewGeometry(complete),
-        )
     }
 
     @Test

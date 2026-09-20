@@ -146,8 +146,6 @@ object CanonEosPtp {
     const val CAPTURE_DESTINATION_HOST = 4L
     const val MAX_TEXT_METADATA_BYTES = 255
     const val MAX_LENS_NAME_BYTES = 512
-    const val EOS_5D_MARK_II_LIVE_VIEW_WIDTH = 5_616
-    const val EOS_5D_MARK_II_LIVE_VIEW_HEIGHT = 3_744
 
     private const val VIEWFINDER_JPEG_BLOCK = 0x01L
     private const val VIEWFINDER_JPEG_BLOCK_ALTERNATE = 0x0BL
@@ -294,21 +292,6 @@ object CanonEosPtp {
 
     fun supportsLiveViewTapAutofocus(info: PtpDeviceInfo): Boolean =
         supportsTouchAutofocus(info) || supportsLiveViewAfFrame(info)
-
-    fun legacyLiveViewGeometry(info: PtpDeviceInfo): CanonEosLiveViewGeometry? {
-        val identity = "${info.manufacturer} ${info.model}"
-        return if (
-            info.supports(CanonEosOperationCode.SET_LIVE_AF_FRAME) &&
-                identity.contains("EOS 5D Mark II", ignoreCase = true)
-        ) {
-            CanonEosLiveViewGeometry(
-                width = EOS_5D_MARK_II_LIVE_VIEW_WIDTH,
-                height = EOS_5D_MARK_II_LIVE_VIEW_HEIGHT,
-            )
-        } else {
-            null
-        }
-    }
 
     fun supportsClickWhiteBalance(info: PtpDeviceInfo): Boolean =
         supportsLiveView(info) && info.supports(CanonEosOperationCode.CLICK_WHITE_BALANCE)

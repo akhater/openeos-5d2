@@ -2595,10 +2595,10 @@ class UsbPtpCameraBackendTest {
     }
 
     @Test
-    fun canonLiveAfFrameUsesFiveDMarkTwoFallbackWhenGeometryBlockIsMissing() = runTest {
+    fun canonLiveAfFrameMapsFiveDMarkTwoStylePointToAdvertisedSensorGeometry() = runTest {
         val transport = CanonEosScriptedTransport(
             advertiseLiveAfFrame = true,
-            cameraModel = "Canon EOS 5D Mark II",
+            liveViewSensorSize = 6_000 to 4_000,
         )
         val backend = UsbPtpCameraBackend(
             connection = CameraConnection.AndroidUsbPtp("usb-5d2"),
@@ -2616,7 +2616,7 @@ class UsbPtpCameraBackendTest {
             container.type == PtpContainerType.COMMAND &&
                 container.code == CanonEosOperationCode.SET_LIVE_AF_FRAME
         }
-        assertEquals(listOf(1_404L, 2_808L), frame.parameters())
+        assertEquals(listOf(1_500L, 3_000L), frame.parameters())
         assertFalse(transport.hasOperation(CanonEosOperationCode.TOUCH_AF_POSITION))
         assertFalse(transport.hasOperation(CanonEosOperationCode.CLICK_WHITE_BALANCE))
         val frameIndex = transport.sentContainers.indexOf(frame)
@@ -3133,7 +3133,6 @@ class UsbPtpCameraBackendTest {
         private val advertiseTouchAutofocus: Boolean = false,
         private val advertiseLiveAfFrame: Boolean = false,
         private val advertiseClickWhiteBalance: Boolean = false,
-        private val cameraModel: String = "Canon EOS R6 Mark III",
         private val liveViewSensorSize: Pair<Int, Int>? = null,
         private val rejectOperationCode: Int? = null,
         private val rejectHalfRemotePress: Boolean = false,
@@ -3192,7 +3191,6 @@ class UsbPtpCameraBackendTest {
                             advertiseTouchAutofocus,
                             advertiseLiveAfFrame,
                             advertiseClickWhiteBalance,
-                            cameraModel,
                             advertiseMovieModeSwitch,
                             advertisePropertyWrites,
                             advertiseTextMetadata || advertiseLensName,
@@ -3849,7 +3847,6 @@ class UsbPtpCameraBackendTest {
             advertiseTouchAutofocus: Boolean = false,
             advertiseLiveAfFrame: Boolean = false,
             advertiseClickWhiteBalance: Boolean = false,
-            cameraModel: String = "Canon EOS R6 Mark III",
             advertiseMovieModeSwitch: Boolean = true,
             advertisePropertyWrites: Boolean = true,
             advertiseTextMetadata: Boolean = false,
@@ -3915,7 +3912,7 @@ class UsbPtpCameraBackendTest {
             u16Array(listOf(PtpObjectFormat.EXIF_JPEG))
             u16Array(listOf(PtpObjectFormat.EXIF_JPEG))
             string("Canon.Inc")
-            string(cameraModel)
+            string("Canon EOS R6 Mark III")
             string("3-1.0.0")
             string("TEST-SERIAL-0001")
         }.bytes()
