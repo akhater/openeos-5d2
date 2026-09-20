@@ -834,7 +834,6 @@ class CanonEosPtpTest {
             CanonEosOperationCode.GET_VIEWFINDER_DATA,
             CanonEosOperationCode.DRIVE_LENS,
             CanonEosOperationCode.CLICK_WHITE_BALANCE,
-            CanonEosOperationCode.SET_LIVE_AF_FRAME,
             CanonEosOperationCode.TOUCH_AF_POSITION,
         )
         val complete = deviceInfo(operations)
@@ -844,8 +843,6 @@ class CanonEosPtpTest {
         assertTrue(CanonEosPtp.supportsLiveView(complete))
         assertTrue(CanonEosPtp.supportsFocusDrive(complete))
         assertTrue(CanonEosPtp.supportsTouchAutofocus(complete))
-        assertTrue(CanonEosPtp.supportsLiveViewAfFrame(complete))
-        assertTrue(CanonEosPtp.supportsLiveViewTapAutofocus(complete))
         assertTrue(CanonEosPtp.supportsClickWhiteBalance(complete))
         assertTrue(CanonEosPtp.supportsPropertyControl(complete))
         assertFalse(
@@ -861,11 +858,6 @@ class CanonEosPtpTest {
         assertFalse(
             CanonEosPtp.supportsTouchAutofocus(
                 deviceInfo(operations - CanonEosOperationCode.TOUCH_AF_POSITION)
-            )
-        )
-        assertFalse(
-            CanonEosPtp.supportsLiveViewAfFrame(
-                deviceInfo(operations - CanonEosOperationCode.SET_LIVE_AF_FRAME)
             )
         )
         assertFalse(

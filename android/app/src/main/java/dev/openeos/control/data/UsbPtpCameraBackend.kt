@@ -226,7 +226,7 @@ class UsbPtpCameraBackend(
         val supportsCanonLiveView = CanonEosPtp.supportsLiveView(info)
         val supportsCanonFocusDrive = CanonEosPtp.supportsFocusDrive(info)
         val supportsCanonLiveViewMagnification = CanonEosPtp.supportsLiveViewMagnification(info)
-        val supportsCanonLiveViewTapAutofocus = CanonEosPtp.supportsLiveViewTapAutofocus(info)
+        val supportsCanonTouchAutofocus = CanonEosPtp.supportsTouchAutofocus(info)
         val supportsCanonClickWhiteBalance = CanonEosPtp.supportsClickWhiteBalance(info)
         val supportsCanonMovieRecording = CanonEosPtp.supportsMovieRecording(
             info,
@@ -270,7 +270,7 @@ class UsbPtpCameraBackend(
                 add(CameraFeature.LIVE_VIEW)
                 add(CameraFeature.LIVE_VIEW_JPEG_POLLING)
             }
-            if (supportsCanonLiveViewTapAutofocus) add(CameraFeature.TAP_FOCUS)
+            if (supportsCanonTouchAutofocus) add(CameraFeature.TAP_FOCUS)
             if (supportsCanonClickWhiteBalance) add(CameraFeature.CLICK_WHITE_BALANCE)
             if (supportsCanonFocusDrive) add(CameraFeature.FOCUS_DRIVE)
             if (supportsCanonLiveViewMagnification) add(CameraFeature.LIVE_VIEW_MAGNIFICATION)
@@ -350,7 +350,7 @@ class UsbPtpCameraBackend(
                     CameraFeature.AUTOFOCUS to
                         "Prefers advertised Canon EOS DoAf/AfCancel and falls back to a balanced half-press sequence.",
                     CameraFeature.TAP_FOCUS to
-                        "Requires advertised Canon EOS TouchAfPosition or SetLiveAfFrame, complete Live View, a balanced Live View AF path, and sensor geometry from viewfinder block 0x0E.",
+                        "Requires advertised Canon EOS TouchAfPosition, complete Live View, a balanced AF path, and sensor geometry from viewfinder block 0x0E.",
                     CameraFeature.CLICK_WHITE_BALANCE to
                         "Requires advertised Canon EOS ClickWB, complete Live View, and sensor geometry from viewfinder block 0x0E.",
                     CameraFeature.FOCUS_DRIVE to
@@ -638,10 +638,6 @@ class UsbPtpCameraBackend(
             return halfPressShutter().also { observedFeatures.add(CameraFeature.AUTOFOCUS) }
         }
 
-        return performCanonAutofocus()
-    }
-
-    private suspend fun performCanonAutofocus(): CameraStatus {
         ensureCanonRemoteMode()
         drainCanonEvents()
         val ptp = requireSession()
@@ -1191,30 +1187,15 @@ class UsbPtpCameraBackend(
 
     override suspend fun tapFocus(x: Double, y: Double): FocusResult {
         val info = requireDeviceInfo()
-        if (!CanonEosPtp.supportsLiveViewTapAutofocus(info)) {
-            unsupported<Unit>(CameraFeature.TAP_FOCUS)
-        }
-        val (cameraX, cameraY) = canonLiveViewCoordinates(x, y, action = "Live View AF")
+        if (!CanonEosPtp.supportsTouchAutofocus(info)) unsupported<Unit>(CameraFeature.TAP_FOCUS)
+        val (cameraX, cameraY) = canonLiveViewCoordinates(x, y, action = "Touch AF")
 
         ensureCanonRemoteMode()
-        if (info.supports(CanonEosOperationCode.TOUCH_AF_POSITION)) {
-            requireSession().executeOperation(
-                CanonEosOperationCode.TOUCH_AF_POSITION,
-                listOf(CANON_TOUCH_AF_MODE, cameraX, cameraY),
-            )
-            autofocus()
-        } else {
-            // EOS 5D Mark II-era bodies advertise SetLiveAfFrame (0x915A)
-            // instead of the newer TouchAfPosition (0x915B). The public
-            // protocol tables do not document a special payload for 0x915A;
-            // these bodies use the same sensor-space X/Y values as the
-            // two-coordinate Canon Live View commands.
-            requireSession().executeOperation(
-                CanonEosOperationCode.SET_LIVE_AF_FRAME,
-                listOf(cameraX, cameraY),
-            )
-            performCanonAutofocus()
-        }
+        requireSession().executeOperation(
+            CanonEosOperationCode.TOUCH_AF_POSITION,
+            listOf(CANON_TOUCH_AF_MODE, cameraX, cameraY),
+        )
+        autofocus()
         observedFeatures.add(CameraFeature.TAP_FOCUS)
         return FocusResult(ok = true, x = x, y = y)
     }

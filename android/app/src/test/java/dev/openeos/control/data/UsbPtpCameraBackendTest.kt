@@ -2595,44 +2595,6 @@ class UsbPtpCameraBackendTest {
     }
 
     @Test
-    fun canonLiveAfFrameMapsFiveDMarkTwoStylePointToAdvertisedSensorGeometry() = runTest {
-        val transport = CanonEosScriptedTransport(
-            advertiseLiveAfFrame = true,
-            liveViewSensorSize = 6_000 to 4_000,
-        )
-        val backend = UsbPtpCameraBackend(
-            connection = CameraConnection.AndroidUsbPtp("usb-5d2"),
-            transportFactory = PtpTransportFactory { transport },
-        )
-        backend.initialize()
-
-        assertTrue(backend.capabilities().matrix.supports(CameraFeature.TAP_FOCUS))
-        backend.startLiveView(LiveViewRequest())
-        backend.liveViewFrame(cacheKey = 1)
-        val result = backend.tapFocus(x = 0.25, y = 0.75)
-
-        assertTrue(result.ok)
-        val frame = transport.sentContainers.single { container ->
-            container.type == PtpContainerType.COMMAND &&
-                container.code == CanonEosOperationCode.SET_LIVE_AF_FRAME
-        }
-        assertEquals(listOf(1_500L, 3_000L), frame.parameters())
-        assertFalse(transport.hasOperation(CanonEosOperationCode.TOUCH_AF_POSITION))
-        assertFalse(transport.hasOperation(CanonEosOperationCode.CLICK_WHITE_BALANCE))
-        val frameIndex = transport.sentContainers.indexOf(frame)
-        val autofocusIndex = transport.sentContainers.indexOfFirst { container ->
-            container.type == PtpContainerType.COMMAND && container.code == CanonEosOperationCode.DO_AF
-        }
-        val cancelIndex = transport.sentContainers.indexOfFirst { container ->
-            container.type == PtpContainerType.COMMAND && container.code == CanonEosOperationCode.AF_CANCEL
-        }
-        assertTrue(autofocusIndex > frameIndex)
-        assertTrue(cancelIndex > autofocusIndex)
-        backend.stopLiveView()
-        backend.close()
-    }
-
-    @Test
     fun canonTouchAutofocusIsUnavailableWithoutAdvertisedOperation() = runTest {
         val transport = CanonEosScriptedTransport(liveViewSensorSize = 6_000 to 4_000)
         val backend = UsbPtpCameraBackend(
@@ -3131,7 +3093,6 @@ class UsbPtpCameraBackendTest {
         private val advertiseRemoteRelease: Boolean = true,
         private val advertiseLiveViewMagnification: Boolean = true,
         private val advertiseTouchAutofocus: Boolean = false,
-        private val advertiseLiveAfFrame: Boolean = false,
         private val advertiseClickWhiteBalance: Boolean = false,
         private val liveViewSensorSize: Pair<Int, Int>? = null,
         private val rejectOperationCode: Int? = null,
@@ -3189,7 +3150,6 @@ class UsbPtpCameraBackendTest {
                             advertiseLiveViewMagnification,
                             advertiseEventPolling,
                             advertiseTouchAutofocus,
-                            advertiseLiveAfFrame,
                             advertiseClickWhiteBalance,
                             advertiseMovieModeSwitch,
                             advertisePropertyWrites,
@@ -3208,7 +3168,6 @@ class UsbPtpCameraBackendTest {
                 CanonEosOperationCode.ZOOM,
                 CanonEosOperationCode.DO_AF,
                 CanonEosOperationCode.AF_CANCEL,
-                CanonEosOperationCode.SET_LIVE_AF_FRAME,
                 CanonEosOperationCode.TOUCH_AF_POSITION,
                 CanonEosOperationCode.CLICK_WHITE_BALANCE,
                 CanonEosOperationCode.TRANSFER_COMPLETE,
@@ -3845,7 +3804,6 @@ class UsbPtpCameraBackendTest {
             advertiseLiveViewMagnification: Boolean = true,
             advertiseEventPolling: Boolean = true,
             advertiseTouchAutofocus: Boolean = false,
-            advertiseLiveAfFrame: Boolean = false,
             advertiseClickWhiteBalance: Boolean = false,
             advertiseMovieModeSwitch: Boolean = true,
             advertisePropertyWrites: Boolean = true,
@@ -3889,9 +3847,6 @@ class UsbPtpCameraBackendTest {
                     }
                     if (advertiseTouchAutofocus) {
                         add(CanonEosOperationCode.TOUCH_AF_POSITION)
-                    }
-                    if (advertiseLiveAfFrame) {
-                        add(CanonEosOperationCode.SET_LIVE_AF_FRAME)
                     }
                     if (advertiseClickWhiteBalance) {
                         add(CanonEosOperationCode.CLICK_WHITE_BALANCE)
