@@ -350,7 +350,7 @@ class UsbPtpCameraBackend(
                     CameraFeature.AUTOFOCUS to
                         "Prefers advertised Canon EOS DoAf/AfCancel and falls back to a balanced half-press sequence.",
                     CameraFeature.TAP_FOCUS to
-                        "Requires advertised Canon EOS TouchAfPosition or SetLiveAfFrame, complete Live View, a balanced Live View AF path, and sensor geometry from viewfinder block 0x0E.",
+                        "Requires advertised Canon EOS TouchAfPosition or SetLiveAfFrame, complete Live View, and a balanced Live View AF path; coordinates use viewfinder block 0x0E, with the known 5D Mark II full-frame fallback when that legacy block is absent.",
                     CameraFeature.CLICK_WHITE_BALANCE to
                         "Requires advertised Canon EOS ClickWB, complete Live View, and sensor geometry from viewfinder block 0x0E.",
                     CameraFeature.FOCUS_DRIVE to
@@ -1194,7 +1194,14 @@ class UsbPtpCameraBackend(
         if (!CanonEosPtp.supportsLiveViewTapAutofocus(info)) {
             unsupported<Unit>(CameraFeature.TAP_FOCUS)
         }
-        val (cameraX, cameraY) = canonLiveViewCoordinates(x, y, action = "Live View AF")
+        val legacyAfFrame = info.supports(CanonEosOperationCode.SET_LIVE_AF_FRAME) &&
+            !info.supports(CanonEosOperationCode.TOUCH_AF_POSITION)
+        val (cameraX, cameraY) = canonLiveViewCoordinates(
+            x,
+            y,
+            action = "Live View AF",
+            fallbackGeometry = if (legacyAfFrame) CanonEosPtp.legacyLiveViewGeometry(info) else null,
+        )
 
         ensureCanonRemoteMode()
         if (info.supports(CanonEosOperationCode.TOUCH_AF_POSITION)) {
@@ -1262,6 +1269,7 @@ class UsbPtpCameraBackend(
         x: Double,
         y: Double,
         action: String,
+        fallbackGeometry: CanonEosLiveViewGeometry? = null,
     ): Pair<Long, Long> {
         if (!canonLiveViewActive) {
             throw PtpProtocolException("Canon EOS USB $action requires an active Live View session.")
@@ -1275,6 +1283,7 @@ class UsbPtpCameraBackend(
         val geometry = canonLiveViewGeometry ?: CanonEosPtp.liveViewData(readCanonViewfinderData())
             .geometry
             ?.also { canonLiveViewGeometry = it }
+            ?: fallbackGeometry?.also { canonLiveViewGeometry = it }
             ?: throw PtpProtocolException(
                 "Canon EOS USB $action requires sensor geometry from Live View block 0x0E."
             )
